@@ -1,0 +1,21 @@
+name: HMTROBOT Fast CI
+
+on:
+  push:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Strict Compile Check
+        run: cargo check --all-targets
+      - name: Run Unit Tests
+        run: cargo test -- --nocapture
