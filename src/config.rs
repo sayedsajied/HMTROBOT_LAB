@@ -216,3 +216,69 @@ impl BotConfig {
         Ok(())
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config_passes_validation() {
+        let cfg = BotConfig::default();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.mode, TradingMode::Paper);
+    }
+
+    #[test]
+    fn test_fee_and_jump_edge_math() {
+        let cfg = BotConfig::default();
+        let rt_maker = cfg.fees.round_trip_maker_bps();
+        let rt_taker = cfg.fees.round_trip_taker_bps();
+        let min_maker_edge = cfg.fees.min_required_edge_bps(3.0, true);
+        let min_taker_edge = cfg.fees.min_required_edge_bps(3.0, false);
+
+        assert!((rt_maker - 5.5).abs() < 1e-9);
+        assert!((rt_taker - 13.0).abs() < 1e-9);
+        assert!((min_maker_edge - 16.5).abs() < 1e-9);
+        assert!((min_taker_edge - 39.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_live_mode_blocks_empty_api_keys() {
+        let mut cfg = BotConfig::default();
+        cfg.mode = TradingMode::Live;
+        assert!(cfg.validate().is_err());
+
+        cfg.api_key = "test_key".to_string();
+        cfg.api_secret = "test_secret".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_blocks_excessive_position_and_nan_capital() {
+        let mut cfg = BotConfig::default();
+        cfg.risk.max_position_usd = 500.0; // Exceeds 100 * 3x = 300
+        assert!(cfg.validate().is_err());
+
+        let mut nan_cfg = BotConfig::default();
+        nan_cfg.initial_capital_usd = f64::NAN;
+        assert!(nan_cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_blocks_unsafe_stale_feed_and_daily_loss() {
+        let mut cfg = BotConfig::default();
+        cfg.risk.stale_feed_ms = 100; // Too low (< 500ms)
+        assert!(cfg.validate().is_err());
+
+        let mut loss_cfg = BotConfig::default();
+        loss_cfg.risk.max_daily_loss_pct = 25.0; // Exceeds 20% hard cap
+        assert!(loss_cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_exchange_endpoints_valid() {
+        for ex in [ExchangeId::DeltaExchange, ExchangeId::Bybit, ExchangeId::Binance] {
+            assert!(ex.ws_url().starts_with("wss://"));
+            assert!(ex.rest_url().starts_with("https://"));
+        }
+    }
+}
