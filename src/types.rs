@@ -195,3 +195,316 @@ impl L2OrderBook {
         now_ms.saturating_sub(self.local_ts_ms) > max_stale_ms
     }
 }
+/// Live trade tape event (Jump Trading aggressor flow stream)
+#[derive(Debug, Clone, Copy)]
+pub struct TradeTick {
+    pub symbol_id: SymbolId,
+    pub price: f64,
+    pub qty: f64,
+    pub aggressor: Side,
+    pub exchange_ts_ms: u64,
+    pub local_ts_ms: u64,
+    pub trade_id: u64,
+}
+
+impl TradeTick {
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.price.is_finite() && self.price > 0.0 && self.qty.is_finite() && self.qty > 0.0
+    }
+
+    #[inline]
+    pub fn notional_usd(&self) -> f64 {
+        if self.is_valid() {
+            self.price * self.qty
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Perpetual vs Spot index basis and funding snapshot
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FundingBasisSnapshot {
+    pub symbol_id: SymbolId,
+    pub mark_price: f64,
+    pub index_price: f64,
+    pub funding_rate: f64,
+    pub next_funding_ts_ms: u64,
+    pub local_ts_ms: u64,
+}
+
+impl FundingBasisSnapshot {
+    /// Basis in basis points: positive means Perp trades at a premium over Spot
+    #[inline]
+    pub fn basis_bps(&self) -> Option<f64> {
+        if !self.mark_price.is_finite()
+            || !self.index_price.is_finite()
+            || self.mark_price <= 0.0
+            || self.index_price <= 0.0
+        {
+            return None;
+        }
+        Some(((self.mark_price - self.index_price) / self.index_price) * 10_000.0)
+    }
+}
+
+/// Multi-timeframe aggregated micro-bar for the 86 alpha engines
+#[derive(Debug, Clone, Copy)]
+pub struct OhlcvBar {
+    pub symbol_id: SymbolId,
+    pub timeframe: Timeframe,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub buy_volume: f64,
+    pub sell_volume: f64,
+    pub trade_count: u32,
+    pub start_ts_ms: u64,
+    pub end_ts_ms: u64,
+}
+
+impl OhlcvBar {
+    /// High-to-low volatility range in bps (used by Vol Spike Veto)
+    #[inline]
+    pub fn range_bps(&self) -> f64 {
+        if !self.open.is_finite()
+            || !self.high.is_finite()
+            || !self.low.is_finite()
+            || self.open <= 0.0
+            || self.high < self.low
+        {
+            return 0.0;
+        }
+        ((self.high - self.low) / self.open) * 10_000.0
+    }
+
+    /// Signed volume delta ratio in [-1.0, 1.0]
+    #[inline]
+    pub fn volume_delta_ratio(&self) -> f64 {
+        let total = self.buy_volume + self.sell_volume;
+        if !total.is_finite() || total <= 0.0 {
+            return 0.0;
+        }
+        ((self.buy_volume - self.sell_volume) / total).clamp(-1.0, 1.0)
+    }
+}
+
+/// Standardized microsecond output from any of the 86 alpha engines
+#[derive(Debug, Clone, Copy)]
+pub struct EngineSignal {
+    pub engine_id: u16,
+    pub timeframe: Timeframe,
+    pub score: f64,      // [-1.0, 1.0]
+    pub confidence: f64, // [0.0, 1.0]
+}
+
+impl EngineSignal {
+    /// Self-healing sanitizer: neutralizes NaN/Inf outputs from faulty engines
+    #[inline]
+    pub fn sanitized(engine_id: u16, timeframe: Timeframe, score: f64, confidence: f64) -> Self {
+        if !score.is_finite() || !confidence.is_finite() {
+            return Self {
+                engine_id,
+                timeframe,
+                score: 0.0,
+                confidence: 0.0,
+            };
+        }
+        Self {
+            engine_id,
+            timeframe,
+            score: score.clamp(-1.0, 1.0),
+            confidence: confidence.clamp(0.0, 1.0),
+        }
+    }
+
+    #[inline]
+    pub fn weighted_score(&self) -> f64 {
+        if !self.score.is_finite() || !self.confidence.is_finite() {
+            return 0.0;
+        }
+        self.score.clamp(-1.0, 1.0) * self.confidence.clamp(0.0, 1.0)
+    }
+}
+
+/// Adverse selection / toxic flow detector state (Jump Trading Pillar #3)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ToxicFlowMetrics {
+    pub buy_aggressor_ratio: f64, // [0.0, 1.0]
+    pub trade_intensity_per_sec: f64,
+    pub book_depletion_ratio: f64, // [0.0, 1.0]
+    pub toxicity_score: f64,       // [0.0, 1.0]
+}
+
+impl ToxicFlowMetrics {
+    #[inline]
+    pub fn is_toxic(&self, threshold: f64) -> bool {
+        self.toxicity_score.is_finite() && self.toxicity_score >= threshold
+    }
+}
+
+/// Institutional order execution types
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderType {
+    PostOnlyLimit,  // Maker-first priority
+    IocLimit,       // Immediate-or-Cancel when edge >= 3x taker cost
+    Market,         // Emergency exit only
+    ReduceOnlyStop, // Exchange-side hard stop-loss
+}
+
+/// Deterministic Order Lifecycle (Wintermute / Optiver anti-duplicate state machine)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderStatus {
+    Idle,
+    Submitting,
+    Open,
+    PartiallyFilled,
+    Cancelling,
+    Filled,
+    Cancelled,
+    Rejected,
+    Failed,
+}
+
+impl OrderStatus {
+    #[inline]
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Filled | Self::Cancelled | Self::Rejected | Self::Failed
+        )
+    }
+
+    #[inline]
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Submitting | Self::Open | Self::PartiallyFilled | Self::Cancelling
+        )
+    }
+
+    /// Strict deterministic state transition validator
+    #[inline]
+    pub fn can_transition_to(self, next: Self) -> bool {
+        match (self, next) {
+            (Self::Idle, Self::Submitting) => true,
+            (
+                Self::Submitting,
+                Self::Open
+                | Self::PartiallyFilled
+                | Self::Filled
+                | Self::Rejected
+                | Self::Failed,
+            ) => true,
+            (
+                Self::Open,
+                Self::PartiallyFilled | Self::Filled | Self::Cancelling | Self::Cancelled,
+            ) => true,
+            (
+                Self::PartiallyFilled,
+                Self::PartiallyFilled | Self::Filled | Self::Cancelling | Self::Cancelled,
+            ) => true,
+            (Self::Cancelling, Self::Cancelled | Self::Filled | Self::Failed) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Zero-allocation deterministic order record
+#[derive(Debug, Clone, Copy)]
+pub struct OrderRecord {
+    pub client_order_id: u64,
+    pub exchange_order_id: u64,
+    pub symbol_id: SymbolId,
+    pub side: Side,
+    pub order_type: OrderType,
+    pub price: f64,
+    pub qty: f64,
+    pub filled_qty: f64,
+    pub status: OrderStatus,
+    pub created_ts_ms: u64,
+    pub updated_ts_ms: u64,
+}
+
+impl OrderRecord {
+    pub fn new(
+        client_order_id: u64,
+        symbol_id: SymbolId,
+        side: Side,
+        order_type: OrderType,
+        price: f64,
+        qty: f64,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            client_order_id,
+            exchange_order_id: 0,
+            symbol_id,
+            side,
+            order_type,
+            price,
+            qty,
+            filled_qty: 0.0,
+            status: OrderStatus::Idle,
+            created_ts_ms: now_ms,
+            updated_ts_ms: now_ms,
+        }
+    }
+
+    #[inline]
+    pub fn remaining_qty(&self) -> f64 {
+        (self.qty - self.filled_qty).max(0.0)
+    }
+
+    pub fn transition_to(&mut self, next: OrderStatus, now_ms: u64) -> Result<(), &'static str> {
+        if !self.status.can_transition_to(next) {
+            return Err("Invalid deterministic order state transition");
+        }
+        self.status = next;
+        self.updated_ts_ms = now_ms;
+        Ok(())
+    }
+}
+
+/// Live inventory & PnL tracker (Jump inventory-skew & exchange reconciliation core)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PositionState {
+    pub symbol_id: SymbolId,
+    pub net_qty: f64, // +ve = Long, -ve = Short, 0.0 = Flat
+    pub avg_entry_price: f64,
+    pub unrealized_pnl_usd: f64,
+    pub realized_pnl_usd: f64,
+    pub hard_sl_price: f64,
+    pub last_update_ms: u64,
+}
+
+impl PositionState {
+    #[inline]
+    pub fn is_flat(&self) -> bool {
+        self.net_qty.abs() < 1e-9
+    }
+
+    #[inline]
+    pub fn notional_usd(&self, mark_price: f64) -> f64 {
+        if !mark_price.is_finite() || mark_price <= 0.0 {
+            return 0.0;
+        }
+        self.net_qty.abs() * mark_price
+    }
+
+    #[inline]
+    pub fn update_unrealized_pnl(&mut self, mark_price: f64, now_ms: u64) {
+        if self.is_flat()
+            || !mark_price.is_finite()
+            || !self.avg_entry_price.is_finite()
+            || mark_price <= 0.0
+        {
+            self.unrealized_pnl_usd = 0.0;
+        } else {
+            self.unrealized_pnl_usd = (mark_price - self.avg_entry_price) * self.net_qty;
+        }
+        self.last_update_ms = now_ms;
+    }
+}
