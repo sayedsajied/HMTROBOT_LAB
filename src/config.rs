@@ -425,3 +425,124 @@ impl BotConfig {
         Ok(())
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_secret_string_redaction_and_trim() {
+        let empty = SecretString::default();
+        assert!(empty.is_empty());
+        assert_eq!(format!("{:?}", empty), "[EMPTY]");
+
+        let secret = SecretString::new("  live_api_key_999  ".to_string());
+        assert!(!secret.is_empty());
+        assert_eq!(secret.expose(), "live_api_key_999");
+        assert_eq!(format!("{:?}", secret), "[REDACTED]");
+        assert!(!format!("{:?}", secret).contains("999"));
+    }
+
+    #[test]
+    fn test_default_config_is_valid_and_paper_mode() {
+        let cfg = BotConfig::default();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.mode, TradingMode::Paper);
+        assert!(cfg.execution.maker_first);
+    }
+
+    #[test]
+    fn test_exchange_endpoints_and_fee_math() {
+        for ex in [ExchangeId::DeltaExchange, ExchangeId::Bybit, ExchangeId::Binance] {
+            assert!(ex.ws_url().starts_with("wss://"));
+            assert!(ex.rest_url().starts_with("https://"));
+        }
+
+        let delta = ExchangeId::DeltaExchange.default_fees();
+        assert!((delta.round_trip_maker_bps() - 5.5).abs() < 1e-9);
+        assert!((delta.round_trip_taker_bps() - 13.0).abs() < 1e-9);
+        assert!((delta.min_required_edge_bps(3.0, true) - 16.5).abs() < 1e-9);
+        assert!((delta.min_required_edge_bps(3.0, false) - 39.0).abs() < 1e-9);
+
+        let bybit = ExchangeId::Bybit.default_fees();
+        assert!((bybit.round_trip_taker_bps() - 13.4).abs() < 1e-9);
+
+        let binance = ExchangeId::Binance.default_fees();
+        assert!((binance.round_trip_taker_bps() - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_live_mode_requires_non_empty_secrets() {
+        let mut cfg = BotConfig::default();
+        cfg.mode = TradingMode::Live;
+        assert!(cfg.validate().is_err());
+
+        cfg.api_key = SecretString::new("key_ok".to_string());
+        assert!(cfg.validate().is_err());
+
+        cfg.api_secret = SecretString::new("secret_ok".to_string());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_execution_config_guards() {
+        let mut cfg = BotConfig::default();
+        cfg.execution.maker_timeout_ms = 50; // Too low (< 100ms)
+        assert!(cfg.validate().is_err());
+
+        let mut cfg2 = BotConfig::default();
+        cfg2.execution.reconcile_interval_sec = 2; // Too frequent (< 5s)
+        assert!(cfg2.validate().is_err());
+
+        let mut cfg3 = BotConfig::default();
+        cfg3.execution.exchange_hard_sl_bps = 2.0; // Too tight (< 5 bps)
+        assert!(cfg3.validate().is_err());
+
+        let mut cfg4 = BotConfig::default();
+        cfg4.execution.max_order_retries = 0; // Must be >= 1
+        assert!(cfg4.validate().is_err());
+    }
+
+    #[test]
+    fn test_risk_and_adverse_selection_guards() {
+        let mut cfg = BotConfig::default();
+        cfg.risk.max_position_usd = 500.0; // Exceeds 100 * 3x = 300
+        assert!(cfg.validate().is_err());
+
+        let mut nan_cfg = BotConfig::default();
+        nan_cfg.initial_capital_usd = f64::NAN;
+        assert!(nan_cfg.validate().is_err());
+
+        let mut toxic_cfg = BotConfig::default();
+        toxic_cfg.risk.toxic_flow_veto_threshold = 1.5; // Must be <= 1.0
+        assert!(toxic_cfg.validate().is_err());
+
+        let mut vol_cfg = BotConfig::default();
+        vol_cfg.risk.vol_spike_veto_bps = 1.0; // Must be >= 5.0
+        assert!(vol_cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_stale_feed_and_daily_loss_bounds() {
+        let mut cfg = BotConfig::default();
+        cfg.risk.stale_feed_ms = 100;
+        assert!(cfg.validate().is_err());
+
+        let mut loss_cfg = BotConfig::default();
+        loss_cfg.risk.max_daily_loss_pct = 25.0;
+        assert!(loss_cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_bot_config_debug_hides_all_secrets() {
+        let mut cfg = BotConfig::default();
+        cfg.api_key = SecretString::new("SUPER_SECRET_KEY".to_string());
+        cfg.api_secret = SecretString::new("SUPER_SECRET_PASS".to_string());
+        cfg.telegram_bot_token = SecretString::new("TG_BOT_TOKEN_123".to_string());
+
+        let dumped = format!("{:?}", cfg);
+        assert!(!dumped.contains("SUPER_SECRET_KEY"));
+        assert!(!dumped.contains("SUPER_SECRET_PASS"));
+        assert!(!dumped.contains("TG_BOT_TOKEN_123"));
+        assert!(dumped.contains("[REDACTED]"));
+    }
+}
