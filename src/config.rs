@@ -102,3 +102,117 @@ impl Default for BotConfig {
         }
     }
 }
+impl ExchangeId {
+    pub fn ws_url(&self) -> &'static str {
+        match self {
+            Self::DeltaExchange => "wss://socket.india.delta.exchange",
+            Self::Bybit => "wss://stream.bybit.com/v5/public/linear",
+            Self::Binance => "wss://fstream.binance.com/ws",
+        }
+    }
+
+    pub fn rest_url(&self) -> &'static str {
+        match self {
+            Self::DeltaExchange => "https://api.india.delta.exchange",
+            Self::Bybit => "https://api.bybit.com",
+            Self::Binance => "https://fapi.binance.com",
+        }
+    }
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+impl BotConfig {
+    /// Zero-panic loader from Render / OS Environment Variables
+    pub fn from_env() -> Result<Self, String> {
+        let mut cfg = Self::default();
+
+        if let Ok(ex) = std::env::var("EXCHANGE") {
+            cfg.exchange = match ex.trim().to_uppercase().as_str() {
+                "BYBIT" => ExchangeId::Bybit,
+                "BINANCE" => ExchangeId::Binance,
+                _ => ExchangeId::DeltaExchange,
+            };
+        }
+
+        if let Ok(mode) = std::env::var("TRADING_MODE") {
+            cfg.mode = match mode.trim().to_uppercase().as_str() {
+                "LIVE" => TradingMode::Live,
+                _ => TradingMode::Paper,
+            };
+        }
+
+        if let Ok(syms) = std::env::var("SYMBOLS") {
+            let parsed: Vec<String> = syms
+                .split(',')
+                .map(|s| s.trim().to_uppercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !parsed.is_empty() {
+                cfg.symbols = parsed;
+            }
+        }
+
+        cfg.initial_capital_usd = env_f64("INITIAL_CAPITAL_USD", cfg.initial_capital_usd);
+        cfg.risk.max_daily_loss_pct = env_f64("MAX_DAILY_LOSS_PCT", cfg.risk.max_daily_loss_pct);
+        cfg.risk.max_position_usd = env_f64("MAX_POSITION_USD", cfg.risk.max_position_usd);
+        cfg.risk.max_leverage = env_f64("MAX_LEVERAGE", cfg.risk.max_leverage);
+        cfg.risk.max_spread_bps = env_f64("MAX_SPREAD_BPS", cfg.risk.max_spread_bps);
+        cfg.risk.stale_feed_ms = env_u64("STALE_FEED_MS", cfg.risk.stale_feed_ms);
+        cfg.health_port = env_u64("PORT", cfg.health_port as u64).clamp(1, 65535) as u16;
+
+        cfg.api_key = std::env::var("API_KEY").unwrap_or_default().trim().to_string();
+        cfg.api_secret = std::env::var("API_SECRET").unwrap_or_default().trim().to_string();
+        cfg.telegram_bot_token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default().trim().to_string();
+        cfg.telegram_chat_id = std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default().trim().to_string();
+
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Hard institutional pre-flight safety validator
+    pub fn validate(&self) -> Result<(), String> {
+        if self.symbols.is_empty() {
+            return Err("Config Error: symbols list cannot be empty".into());
+        }
+        if !self.initial_capital_usd.is_finite() || self.initial_capital_usd <= 0.0 {
+            return Err("Config Error: initial_capital_usd must be > 0".into());
+        }
+        if self.risk.max_daily_loss_pct <= 0.0 || self.risk.max_daily_loss_pct > 20.0 {
+            return Err("Config Error: max_daily_loss_pct must be in (0, 20]".into());
+        }
+        if self.risk.max_leverage < 1.0 || self.risk.max_leverage > 20.0 {
+            return Err("Config Error: max_leverage must be in [1.0, 20.0]".into());
+        }
+        if self.risk.max_position_usd <= 0.0
+            || self.risk.max_position_usd > (self.initial_capital_usd * self.risk.max_leverage)
+        {
+            return Err("Config Error: max_position_usd exceeds capital * leverage".into());
+        }
+        if self.risk.stale_feed_ms < 500 || self.risk.stale_feed_ms > 10_000 {
+            return Err("Config Error: stale_feed_ms must be between 500ms and 10000ms".into());
+        }
+        if self.risk.min_edge_to_fee_ratio < 1.5 {
+            return Err("Config Error: min_edge_to_fee_ratio must be >= 1.5".into());
+        }
+        if self.mode == TradingMode::Live
+            && (self.api_key.is_empty() || self.api_secret.is_empty())
+        {
+            return Err("FATAL SAFETY BLOCK: LIVE mode requires non-empty API_KEY and API_SECRET".into());
+        }
+        Ok(())
+    }
+}
