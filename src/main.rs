@@ -1,12 +1,6 @@
 mod config;
 
 fn main() {
-    let cfg = config::BotConfig::default();
-    println!("HMTROBOT_LAB v2 | {:?}", cfg);
-}
-mod config;
-
-fn main() {
     match config::BotConfig::from_env() {
         Ok(cfg) => println!(
             "HMTROBOT_LAB v2 OK | {:?} | MinMakerEdge: {:.2}bps",
