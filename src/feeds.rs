@@ -732,3 +732,200 @@ fn parse_binance(v: &Value, symbols: &[String], local_ts_ms: u64) -> Option<Feed
         _ => None,
     }
 }
+use crate::config::BotConfig;
+use futures_util::{SinkExt, StreamExt};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, watch};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+#[inline]
+pub fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[inline]
+fn build_heartbeat_payload(exchange: ExchangeId) -> Option<&'static str> {
+    match exchange {
+        ExchangeId::DeltaExchange => Some(r#"{"type":"ping"}"#),
+        ExchangeId::Bybit => Some(r#"{"op":"ping"}"#),
+        ExchangeId::Binance => None, // Binance relies on native WS Ping/Pong frames
+    }
+}
+
+#[inline]
+fn try_dispatch(
+    tx: &mpsc::Sender<FeedEvent>,
+    health: &mut FeedHealthMonitor,
+    event: FeedEvent,
+) {
+    if tx.try_send(event).is_err() {
+        health.dropped_event_count = health.dropped_event_count.saturating_add(1);
+    }
+}
+
+/// Routes a parsed exchange event through ToxicFlowTracker & MtfBarAggregator without heap allocations
+pub fn process_parsed_event(
+    event: FeedEvent,
+    toxic_trackers: &mut [ToxicFlowTracker],
+    bar_aggs: &mut [MtfBarAggregator],
+    tx: &mpsc::Sender<FeedEvent>,
+    health: &mut FeedHealthMonitor,
+) {
+    match event {
+        FeedEvent::OrderBook(book) => {
+            health.on_book(book.local_ts_ms);
+            if let Some(tracker) = toxic_trackers.get_mut(book.symbol_id.0 as usize) {
+                tracker.on_book(&book);
+            }
+            try_dispatch(tx, health, FeedEvent::OrderBook(book));
+        }
+        FeedEvent::Trade(tick) => {
+            health.on_message(tick.local_ts_ms);
+            if let Some(tracker) = toxic_trackers.get_mut(tick.symbol_id.0 as usize) {
+                let metrics = tracker.on_trade(&tick);
+                try_dispatch(tx, health, FeedEvent::ToxicUpdate(tick.symbol_id, metrics));
+            }
+            if let Some(agg) = bar_aggs.get_mut(tick.symbol_id.0 as usize) {
+                let closed_bars = agg.on_trade(&tick);
+                for maybe_bar in closed_bars {
+                    if let Some(bar) = maybe_bar {
+                        try_dispatch(tx, health, FeedEvent::BarClosed(bar));
+                    }
+                }
+            }
+            try_dispatch(tx, health, FeedEvent::Trade(tick));
+        }
+        FeedEvent::FundingBasis(fb) => {
+            health.on_message(fb.local_ts_ms);
+            try_dispatch(tx, health, FeedEvent::FundingBasis(fb));
+        }
+        other => try_dispatch(tx, health, other),
+    }
+}
+
+/// 24/7 Auto-Reconnect WebSocket Supervisor with Heartbeat, Stale Watchdog & Graceful Shutdown
+pub async fn run_feed_supervisor(
+    cfg: BotConfig,
+    tx: mpsc::Sender<FeedEvent>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    // Pre-allocate per-symbol stack engines ONCE at startup (zero hot-path allocation)
+    let mut toxic_trackers: Vec<ToxicFlowTracker> = cfg
+        .symbols
+        .iter()
+        .map(|_| ToxicFlowTracker::new(5_000))
+        .collect();
+    let mut bar_aggs: Vec<MtfBarAggregator> = cfg
+        .symbols
+        .iter()
+        .enumerate()
+        .map(|(i, _)| MtfBarAggregator::new(SymbolId(i as u16)))
+        .collect();
+
+    let mut health = FeedHealthMonitor::default();
+    let mut backoff = ReconnectBackoff::new(500, 30_000);
+    let ws_url = cfg.exchange.ws_url();
+    let sub_payload = build_subscribe_payload(cfg.exchange, &cfg.symbols);
+
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        let connect_res = tokio::time::timeout(Duration::from_secs(10), connect_async(ws_url)).await;
+
+        if let Ok(Ok((ws_stream, _))) = connect_res {
+            let (mut write, mut read) = ws_stream.split();
+
+            if write.send(Message::Text(sub_payload.clone().into())).await.is_ok() {
+                backoff.reset();
+                health.on_connected(now_epoch_ms());
+                try_dispatch(&tx, &mut health, FeedEvent::Connected);
+
+                let mut watchdog = tokio::time::interval(Duration::from_secs(1));
+                let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+                watchdog.tick().await;
+                heartbeat.tick().await;
+
+                loop {
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                let _ = write.send(Message::Close(None)).await;
+                                return;
+                            }
+                        }
+                        _ = watchdog.tick() => {
+                            if health.is_stale(now_epoch_ms(), cfg.risk.stale_feed_ms) {
+                                break;
+                            }
+                        }
+                        _ = heartbeat.tick() => {
+                            let ping_res = if let Some(json_ping) = build_heartbeat_payload(cfg.exchange) {
+                                write.send(Message::Text(json_ping.to_string().into())).await
+                            } else {
+                                write.send(Message::Ping(Vec::new().into())).await
+                            };
+                            if ping_res.is_err() {
+                                break;
+                            }
+                        }
+                        msg_opt = read.next() => {
+                            match msg_opt {
+                                Some(Ok(Message::Text(txt))) => {
+                                    let now_ms = now_epoch_ms();
+                                    health.on_message(now_ms);
+                                    if let Some(event) = parse_ws_message(
+                                        cfg.exchange,
+                                        &txt,
+                                        &cfg.symbols,
+                                        now_ms,
+                                    ) {
+                                        process_parsed_event(
+                                            event,
+                                            &mut toxic_trackers,
+                                            &mut bar_aggs,
+                                            &tx,
+                                            &mut health,
+                                        );
+                                    }
+                                }
+                                Some(Ok(Message::Ping(payload))) => {
+                                    health.on_message(now_epoch_ms());
+                                    if write.send(Message::Pong(payload)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Some(Ok(Message::Pong(_))) => {
+                                    health.on_message(now_epoch_ms());
+                                }
+                                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+
+            health.on_disconnected();
+            try_dispatch(&tx, &mut health, FeedEvent::Disconnected);
+        } else {
+            health.on_disconnected();
+        }
+
+        let delay_ms = backoff.next_delay_ms(now_epoch_ms());
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
