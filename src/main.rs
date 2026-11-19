@@ -1,3 +1,6 @@
+mod config;
+
 fn main() {
-    println!("HMTROBOT_LAB initialized.");
+    let cfg = config::BotConfig::default();
+    println!("HMTROBOT_LAB ready | Exchange: {:?} | Mode: {:?}", cfg.exchange, cfg.mode);
 }
