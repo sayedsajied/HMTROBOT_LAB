@@ -508,3 +508,205 @@ impl PositionState {
         self.last_update_ms = now_ms;
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_is_copy<T: Copy>() {}
+
+    #[test]
+    fn test_hot_path_structs_are_zero_allocation_copy() {
+        assert_is_copy::<L2OrderBook>();
+        assert_is_copy::<TradeTick>();
+        assert_is_copy::<FundingBasisSnapshot>();
+        assert_is_copy::<OhlcvBar>();
+        assert_is_copy::<EngineSignal>();
+        assert_is_copy::<ToxicFlowMetrics>();
+        assert_is_copy::<OrderRecord>();
+        assert_is_copy::<PositionState>();
+    }
+
+    #[test]
+    fn test_l2_book_microprice_spread_and_imbalance() {
+        let mut book = L2OrderBook::default();
+        book.symbol_id = SymbolId(0);
+        book.bids[0] = PriceLevel { price: 100.0, qty: 3.0 };
+        book.bids[1] = PriceLevel { price: 99.5, qty: 5.0 };
+        book.bid_count = 2;
+
+        book.asks[0] = PriceLevel { price: 102.0, qty: 1.0 };
+        book.asks[1] = PriceLevel { price: 102.5, qty: 1.0 };
+        book.ask_count = 2;
+
+        book.exchange_ts_ms = 10_000;
+        book.local_ts_ms = 10_045;
+
+        assert!(book.is_valid());
+        assert_eq!(book.feed_latency_ms(), 45);
+        assert!(!book.is_stale(12_000, 3_000));
+        assert!(book.is_stale(13_500, 3_000));
+
+        let mid = book.mid_price().unwrap();
+        assert!((mid - 101.0).abs() < 1e-9);
+
+        // Microprice = (100*1 + 102*3) / (3 + 1) = 101.5 (heavy bid pushes fair value up)
+        let micro = book.microprice().unwrap();
+        assert!((micro - 101.5).abs() < 1e-9);
+
+        // Top-2 Imbalance = (8 - 2) / (8 + 2) = +0.6
+        assert!((book.imbalance(2) - 0.6).abs() < 1e-9);
+
+        let spread = book.spread_bps().unwrap();
+        assert!((spread - (20_000.0 / 101.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_crossed_or_nan_orderbook_is_rejected() {
+        let mut crossed = L2OrderBook::default();
+        crossed.bids[0] = PriceLevel { price: 105.0, qty: 2.0 };
+        crossed.asks[0] = PriceLevel { price: 104.0, qty: 2.0 };
+        crossed.bid_count = 1;
+        crossed.ask_count = 1;
+
+        assert!(!crossed.is_valid());
+        assert!(crossed.mid_price().is_none());
+        assert!(crossed.microprice().is_none());
+
+        let mut nan_book = L2OrderBook::default();
+        nan_book.bids[0] = PriceLevel { price: f64::NAN, qty: 1.0 };
+        nan_book.asks[0] = PriceLevel { price: 100.0, qty: 1.0 };
+        nan_book.bid_count = 1;
+        nan_book.ask_count = 1;
+
+        assert!(!nan_book.is_valid());
+    }
+
+    #[test]
+    fn test_trade_tick_and_funding_basis() {
+        let tick = TradeTick {
+            symbol_id: SymbolId(0),
+            price: 90_000.0,
+            qty: 0.25,
+            aggressor: Side::Buy,
+            exchange_ts_ms: 1_000,
+            local_ts_ms: 1_020,
+            trade_id: 42,
+        };
+        assert!(tick.is_valid());
+        assert!((tick.notional_usd() - 22_500.0).abs() < 1e-9);
+
+        let basis = FundingBasisSnapshot {
+            symbol_id: SymbolId(0),
+            mark_price: 100_050.0,
+            index_price: 100_000.0,
+            funding_rate: 0.0001,
+            next_funding_ts_ms: 9_999,
+            local_ts_ms: 1_020,
+        };
+        assert!((basis.basis_bps().unwrap() - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_ohlcv_bar_volatility_and_delta() {
+        let bar = OhlcvBar {
+            symbol_id: SymbolId(1),
+            timeframe: Timeframe::Sec15,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.5,
+            buy_volume: 7.0,
+            sell_volume: 3.0,
+            trade_count: 18,
+            start_ts_ms: 0,
+            end_ts_ms: 15_000,
+        };
+        assert!((bar.range_bps() - 200.0).abs() < 1e-9);
+        assert!((bar.volume_delta_ratio() - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_engine_signal_self_healing_sanitizer() {
+        let bad = EngineSignal::sanitized(7, Timeframe::Sec1, f64::NAN, 0.9);
+        assert_eq!(bad.score, 0.0);
+        assert_eq!(bad.confidence, 0.0);
+        assert_eq!(bad.weighted_score(), 0.0);
+
+        let clamped = EngineSignal::sanitized(8, Timeframe::Min1, 5.0, 2.0);
+        assert_eq!(clamped.score, 1.0);
+        assert_eq!(clamped.confidence, 1.0);
+        assert_eq!(clamped.weighted_score(), 1.0);
+    }
+
+    #[test]
+    fn test_toxic_flow_threshold_guard() {
+        let toxic = ToxicFlowMetrics {
+            buy_aggressor_ratio: 0.92,
+            trade_intensity_per_sec: 40.0,
+            book_depletion_ratio: 0.85,
+            toxicity_score: 0.82,
+        };
+        assert!(toxic.is_toxic(0.75));
+        assert!(!toxic.is_toxic(0.90));
+
+        let nan_toxic = ToxicFlowMetrics {
+            toxicity_score: f64::NAN,
+            ..Default::default()
+        };
+        assert!(!nan_toxic.is_toxic(0.5));
+    }
+
+    #[test]
+    fn test_deterministic_order_state_machine() {
+        let mut order = OrderRecord::new(
+            1001,
+            SymbolId(0),
+            Side::Buy,
+            OrderType::PostOnlyLimit,
+            95_000.0,
+            0.1,
+            1_000,
+        );
+        assert_eq!(order.status, OrderStatus::Idle);
+        assert!((order.remaining_qty() - 0.1).abs() < 1e-9);
+
+        // Illegal jump Idle -> Filled must fail
+        assert!(order.transition_to(OrderStatus::Filled, 1_005).is_err());
+
+        // Valid institutional lifecycle
+        assert!(order.transition_to(OrderStatus::Submitting, 1_010).is_ok());
+        assert!(order.status.is_active());
+        assert!(order.transition_to(OrderStatus::Open, 1_020).is_ok());
+        assert!(order.transition_to(OrderStatus::PartiallyFilled, 1_050).is_ok());
+        order.filled_qty = 0.04;
+        assert!((order.remaining_qty() - 0.06).abs() < 1e-9);
+        assert!(order.transition_to(OrderStatus::Filled, 1_090).is_ok());
+        assert!(order.status.is_terminal());
+
+        // Terminal state cannot reopen
+        assert!(order.transition_to(OrderStatus::Open, 1_100).is_err());
+    }
+
+    #[test]
+    fn test_position_state_long_and_short_pnl() {
+        let mut long_pos = PositionState {
+            symbol_id: SymbolId(0),
+            net_qty: 0.5,
+            avg_entry_price: 100_000.0,
+            ..Default::default()
+        };
+        assert!(!long_pos.is_flat());
+        long_pos.update_unrealized_pnl(101_000.0, 5_000);
+        assert!((long_pos.unrealized_pnl_usd - 500.0).abs() < 1e-9);
+        assert!((long_pos.notional_usd(101_000.0) - 50_500.0).abs() < 1e-9);
+
+        let mut short_pos = PositionState {
+            symbol_id: SymbolId(0),
+            net_qty: -0.5,
+            avg_entry_price: 100_000.0,
+            ..Default::default()
+        };
+        short_pos.update_unrealized_pnl(99_000.0, 5_000);
+        assert!((short_pos.unrealized_pnl_usd - 500.0).abs() < 1e-9);
+    }
+}
