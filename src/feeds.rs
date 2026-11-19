@@ -929,3 +929,277 @@ pub async fn run_feed_supervisor(
         }
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_is_copy<T: Copy>() {}
+
+    #[test]
+    fn test_feed_hot_path_structs_are_copy() {
+        assert_is_copy::<FeedEvent>();
+        assert_is_copy::<FeedHealthMonitor>();
+        assert_is_copy::<ReconnectBackoff>();
+        assert_is_copy::<ToxicFlowTracker>();
+        assert_is_copy::<MtfBarAggregator>();
+    }
+
+    #[test]
+    fn test_subscribe_payloads_are_valid_json() {
+        let symbols = vec!["BTCUSD".to_string(), "PAXGUSD".to_string()];
+        for ex in [ExchangeId::DeltaExchange, ExchangeId::Bybit, ExchangeId::Binance] {
+            let payload = build_subscribe_payload(ex, &symbols);
+            let parsed: Result<Value, _> = serde_json::from_str(&payload);
+            assert!(parsed.is_ok());
+            assert!(payload.to_uppercase().contains("BTCUSD"));
+        }
+    }
+
+    #[test]
+    fn test_delta_exchange_real_json_parsers() {
+        let symbols = vec!["BTCUSD".to_string(), "PAXGUSD".to_string()];
+
+        // 1. L2 Orderbook with microsecond timestamp
+        let book_json = r#"{
+            "type": "l2_orderbook",
+            "symbol": "BTCUSD",
+            "timestamp": 1700000000123456,
+            "sequence_no": 99,
+            "buy": [{"limit_price": "95000.5", "size": 10}],
+            "sell": [{"limit_price": "95001.5", "size": 5}]
+        }"#;
+        match parse_ws_message(ExchangeId::DeltaExchange, book_json, &symbols, 1700000000150) {
+            Some(FeedEvent::OrderBook(book)) => {
+                assert_eq!(book.symbol_id, SymbolId(0));
+                assert_eq!(book.exchange_ts_ms, 1700000000123);
+                assert_eq!(book.feed_latency_ms(), 27);
+                assert!(book.is_valid());
+            }
+            _ => panic!("Expected valid Delta L2OrderBook"),
+        }
+
+        // 2. Live Trade Tape
+        let trade_json = r#"{
+            "type": "all_trades",
+            "symbol": "BTCUSD",
+            "price": "95001.0",
+            "size": 2.5,
+            "buyer_role": "taker",
+            "timestamp": 1700000000500000,
+            "trade_id": 777
+        }"#;
+        match parse_ws_message(ExchangeId::DeltaExchange, trade_json, &symbols, 1700000000510) {
+            Some(FeedEvent::Trade(t)) => {
+                assert_eq!(t.aggressor, Side::Buy);
+                assert_eq!(t.trade_id, 777);
+                assert!((t.price - 95001.0).abs() < 1e-9);
+            }
+            _ => panic!("Expected valid Delta TradeTick"),
+        }
+
+        // 3. v2/ticker Funding & Basis
+        let ticker_json = r#"{
+            "type": "v2/ticker",
+            "symbol": "BTCUSD",
+            "mark_price": "100050.0",
+            "spot_price": "100000.0",
+            "funding_rate": "0.0001",
+            "timestamp": 1700000000600000
+        }"#;
+        match parse_ws_message(ExchangeId::DeltaExchange, ticker_json, &symbols, 1700000000610) {
+            Some(FeedEvent::FundingBasis(fb)) => {
+                assert!((fb.basis_bps().unwrap() - 5.0).abs() < 1e-9);
+            }
+            _ => panic!("Expected valid Delta FundingBasis"),
+        }
+    }
+
+    #[test]
+    fn test_bybit_binance_and_malformed_json_safety() {
+        let symbols = vec!["BTCUSD".to_string()];
+
+        let bybit_book = r#"{
+            "topic": "orderbook.50.BTCUSD",
+            "ts": 1700000001000,
+            "data": {"s": "BTCUSD", "seq": 12, "b": [["90000", "2.5"]], "a": [["90005", "1.5"]]}
+        }"#;
+        assert!(matches!(
+            parse_ws_message(ExchangeId::Bybit, bybit_book, &symbols, 1700000001020),
+            Some(FeedEvent::OrderBook(_))
+        ));
+
+        // Binance aggTrade: m=true => buyer is maker => Sell aggressor
+        let binance_trade = r#"{
+            "e": "aggTrade",
+            "E": 1700000002000,
+            "s": "BTCUSD",
+            "a": 55,
+            "p": "90002.0",
+            "q": "0.5",
+            "T": 1700000001999,
+            "m": true
+        }"#;
+        match parse_ws_message(ExchangeId::Binance, binance_trade, &symbols, 1700000002010) {
+            Some(FeedEvent::Trade(t)) => assert_eq!(t.aggressor, Side::Sell),
+            _ => panic!("Expected valid Binance TradeTick"),
+        }
+
+        // Corrupted JSON or unknown symbol must return None without panic
+        assert!(parse_ws_message(ExchangeId::DeltaExchange, "{bad json", &symbols, 100).is_none());
+        let unknown_sym = r#"{"type":"all_trades","symbol":"DOGEUSD","price":"0.1","size":10}"#;
+        assert!(parse_ws_message(ExchangeId::DeltaExchange, unknown_sym, &symbols, 100).is_none());
+    }
+
+    #[test]
+    fn test_mtf_bar_aggregator_rollover_and_stale_guard() {
+        let mut agg = MtfBarAggregator::new(SymbolId(0));
+
+        let t1 = TradeTick {
+            symbol_id: SymbolId(0),
+            price: 100.0,
+            qty: 1.0,
+            aggressor: Side::Buy,
+            exchange_ts_ms: 1_100,
+            local_ts_ms: 1_110,
+            trade_id: 1,
+        };
+        assert!(agg.on_trade(&t1).iter().all(|b| b.is_none()));
+
+        let t2 = TradeTick {
+            price: 102.0,
+            qty: 2.0,
+            exchange_ts_ms: 1_800,
+            local_ts_ms: 1_810,
+            trade_id: 2,
+            ..t1
+        };
+        assert!(agg.on_trade(&t2).iter().all(|b| b.is_none()));
+
+        // Trade at 2_100ms closes only the 1s bar (index 0)
+        let t3 = TradeTick {
+            price: 101.0,
+            qty: 1.0,
+            aggressor: Side::Sell,
+            exchange_ts_ms: 2_100,
+            local_ts_ms: 2_110,
+            trade_id: 3,
+            ..t1
+        };
+        let closed = agg.on_trade(&t3);
+        let bar_1s = closed[0].expect("1s bar should close");
+        assert_eq!(bar_1s.timeframe, Timeframe::Sec1);
+        assert!((bar_1s.open - 100.0).abs() < 1e-9);
+        assert!((bar_1s.high - 102.0).abs() < 1e-9);
+        assert!((bar_1s.buy_volume - 3.0).abs() < 1e-9);
+        assert!(closed[1].is_none()); // 15s bar still open
+
+        // Out-of-order stale trade (500ms) must be safely ignored
+        let stale = TradeTick {
+            exchange_ts_ms: 500,
+            local_ts_ms: 2_200,
+            ..t1
+        };
+        assert!(agg.on_trade(&stale).iter().all(|b| b.is_none()));
+    }
+
+    #[test]
+    fn test_toxic_flow_tracker_detects_whale_sweep() {
+        let mut tracker = ToxicFlowTracker::new(5_000);
+
+        // Initial thick book (top depth = 100)
+        let mut book1 = L2OrderBook::default();
+        book1.bids[0] = PriceLevel { price: 100.0, qty: 50.0 };
+        book1.asks[0] = PriceLevel { price: 101.0, qty: 50.0 };
+        book1.bid_count = 1;
+        book1.ask_count = 1;
+        tracker.on_book(&book1);
+
+        // Sudden 90% book depletion (top depth = 10)
+        let mut book2 = book1;
+        book2.bids[0].qty = 5.0;
+        book2.asks[0].qty = 5.0;
+        tracker.on_book(&book2);
+
+        // Burst of 20 one-sided Buy sweeps inside 1 second
+        let mut last_metrics = ToxicFlowMetrics::default();
+        for i in 0..20u64 {
+            let tick = TradeTick {
+                symbol_id: SymbolId(0),
+                price: 101.0,
+                qty: 5.0,
+                aggressor: Side::Buy,
+                exchange_ts_ms: 10_000 + (i * 40),
+                local_ts_ms: 10_000 + (i * 40),
+                trade_id: i,
+            };
+            last_metrics = tracker.on_trade(&tick);
+        }
+
+        assert!((last_metrics.buy_aggressor_ratio - 1.0).abs() < 1e-9);
+        assert!(last_metrics.book_depletion_ratio >= 0.85);
+        assert!(last_metrics.is_toxic(0.75));
+    }
+
+    #[test]
+    fn test_feed_health_monitor_stale_detection() {
+        let mut health = FeedHealthMonitor::default();
+        assert!(health.is_stale(1_000, 3_000));
+
+        health.on_connected(1_000);
+        assert!(!health.is_stale(3_500, 3_000));
+        assert!(health.is_stale(4_500, 3_000));
+
+        health.on_disconnected();
+        assert!(health.is_stale(4_500, 3_000));
+        assert_eq!(health.reconnect_count, 1);
+    }
+
+    #[test]
+    fn test_reconnect_backoff_growth_cap_and_reset() {
+        let mut backoff = ReconnectBackoff::new(500, 10_000);
+        let d1 = backoff.next_delay_ms(0);
+        let d2 = backoff.next_delay_ms(0);
+        let d3 = backoff.next_delay_ms(0);
+        assert_eq!(d1, 500);
+        assert_eq!(d2, 1_000);
+        assert_eq!(d3, 2_000);
+
+        for _ in 0..10 {
+            let d = backoff.next_delay_ms(123);
+            assert!(d <= 10_000);
+        }
+
+        backoff.reset();
+        assert_eq!(backoff.next_delay_ms(0), 500);
+    }
+
+    #[test]
+    fn test_non_blocking_dispatch_counts_backpressure_drops() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut trackers = vec![ToxicFlowTracker::new(5_000)];
+        let mut aggs = vec![MtfBarAggregator::new(SymbolId(0))];
+        let mut health = FeedHealthMonitor::default();
+
+        let tick = TradeTick {
+            symbol_id: SymbolId(0),
+            price: 95_000.0,
+            qty: 0.5,
+            aggressor: Side::Buy,
+            exchange_ts_ms: 5_000,
+            local_ts_ms: 5_010,
+            trade_id: 1,
+        };
+
+        // Trade produces 2 events (ToxicUpdate + Trade) into a capacity-1 channel
+        process_parsed_event(
+            FeedEvent::Trade(tick),
+            &mut trackers,
+            &mut aggs,
+            &tx,
+            &mut health,
+        );
+
+        assert_eq!(health.dropped_event_count, 1);
+        assert!(matches!(rx.try_recv(), Ok(FeedEvent::ToxicUpdate(_, _))));
+    }
+}
