@@ -344,3 +344,391 @@ impl MtfBarAggregator {
         }
     }
 }
+use crate::config::ExchangeId;
+use crate::types::{PriceLevel, BOOK_DEPTH};
+use serde_json::{json, Value};
+
+#[inline]
+fn normalize_ts_ms(raw: u64) -> u64 {
+    if raw > 1_000_000_000_000_000 {
+        raw / 1_000 // microseconds -> milliseconds
+    } else if raw > 1_000_000_000_000 {
+        raw // already milliseconds
+    } else if raw > 1_000_000_000 {
+        raw.saturating_mul(1_000) // seconds -> milliseconds
+    } else {
+        raw
+    }
+}
+
+#[inline]
+fn val_to_f64(v: &Value) -> Option<f64> {
+    let parsed = v
+        .as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))?;
+    if parsed.is_finite() {
+        Some(parsed)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn val_to_u64(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+}
+
+#[inline]
+fn resolve_symbol_id(symbols: &[String], raw_sym: &str) -> Option<SymbolId> {
+    symbols
+        .iter()
+        .position(|s| s.eq_ignore_ascii_case(raw_sym))
+        .map(|idx| SymbolId(idx as u16))
+}
+
+/// Builds the real exchange WebSocket subscription JSON for L2 Depth, Trades, and Ticker/Funding
+pub fn build_subscribe_payload(exchange: ExchangeId, symbols: &[String]) -> String {
+    match exchange {
+        ExchangeId::DeltaExchange => json!({
+            "type": "subscribe",
+            "payload": {
+                "channels": [
+                    { "name": "l2_orderbook", "symbols": symbols },
+                    { "name": "all_trades", "symbols": symbols },
+                    { "name": "v2/ticker", "symbols": symbols }
+                ]
+            }
+        })
+        .to_string(),
+        ExchangeId::Bybit => {
+            let mut args = Vec::with_capacity(symbols.len() * 3);
+            for s in symbols {
+                args.push(format!("orderbook.50.{}", s));
+                args.push(format!("publicTrade.{}", s));
+                args.push(format!("tickers.{}", s));
+            }
+            json!({
+                "op": "subscribe",
+                "args": args
+            })
+            .to_string()
+        }
+        ExchangeId::Binance => {
+            let mut params = Vec::with_capacity(symbols.len() * 3);
+            for s in symbols {
+                let lower = s.to_lowercase();
+                params.push(format!("{}@depth10@100ms", lower));
+                params.push(format!("{}@aggTrade", lower));
+                params.push(format!("{}@markPrice@1s", lower));
+            }
+            json!({
+                "method": "SUBSCRIBE",
+                "params": params,
+                "id": 1
+            })
+            .to_string()
+        }
+    }
+}
+
+/// Zero-panic unified parser for Delta Exchange, Bybit, and Binance live JSON streams
+pub fn parse_ws_message(
+    exchange: ExchangeId,
+    raw_json: &str,
+    symbols: &[String],
+    local_ts_ms: u64,
+) -> Option<FeedEvent> {
+    let v: Value = serde_json::from_str(raw_json).ok()?;
+    match exchange {
+        ExchangeId::DeltaExchange => parse_delta(&v, symbols, local_ts_ms),
+        ExchangeId::Bybit => parse_bybit(&v, symbols, local_ts_ms),
+        ExchangeId::Binance => parse_binance(&v, symbols, local_ts_ms),
+    }
+}
+
+fn fill_tuple_levels(arr: &[Value], out: &mut [PriceLevel; BOOK_DEPTH]) -> usize {
+    let mut count = 0usize;
+    for entry in arr.iter() {
+        if count >= BOOK_DEPTH {
+            break;
+        }
+        if let Some(pair) = entry.as_array() {
+            if pair.len() >= 2 {
+                if let (Some(price), Some(qty)) = (val_to_f64(&pair[0]), val_to_f64(&pair[1])) {
+                    if price > 0.0 && qty > 0.0 {
+                        out[count] = PriceLevel { price, qty };
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+    count
+}
+
+fn fill_delta_levels(arr: &[Value], out: &mut [PriceLevel; BOOK_DEPTH]) -> usize {
+    let mut count = 0usize;
+    for entry in arr.iter() {
+        if count >= BOOK_DEPTH {
+            break;
+        }
+        let price = entry.get("limit_price").and_then(val_to_f64);
+        let qty = entry.get("size").and_then(val_to_f64);
+        if let (Some(p), Some(q)) = (price, qty) {
+            if p > 0.0 && q > 0.0 {
+                out[count] = PriceLevel { price: p, qty: q };
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn parse_delta(v: &Value, symbols: &[String], local_ts_ms: u64) -> Option<FeedEvent> {
+    let msg_type = v.get("type")?.as_str()?;
+    let sym_str = v.get("symbol")?.as_str()?;
+    let symbol_id = resolve_symbol_id(symbols, sym_str)?;
+    let ex_ts = v
+        .get("timestamp")
+        .and_then(val_to_u64)
+        .map(normalize_ts_ms)
+        .unwrap_or(local_ts_ms);
+
+    match msg_type {
+        "l2_orderbook" => {
+            let mut book = L2OrderBook {
+                symbol_id,
+                exchange_ts_ms: ex_ts,
+                local_ts_ms,
+                seq_id: v.get("sequence_no").and_then(val_to_u64).unwrap_or(0),
+                ..Default::default()
+            };
+            if let Some(buys) = v.get("buy").and_then(|x| x.as_array()) {
+                book.bid_count = fill_delta_levels(buys, &mut book.bids);
+            }
+            if let Some(sells) = v.get("sell").and_then(|x| x.as_array()) {
+                book.ask_count = fill_delta_levels(sells, &mut book.asks);
+            }
+            if book.is_valid() {
+                Some(FeedEvent::OrderBook(book))
+            } else {
+                None
+            }
+        }
+        "all_trades" => {
+            let price = v.get("price").and_then(val_to_f64)?;
+            let qty = v.get("size").and_then(val_to_f64)?;
+            let aggressor = match v.get("buyer_role").and_then(|x| x.as_str()) {
+                Some("taker") => Side::Buy,
+                _ => Side::Sell,
+            };
+            let tick = TradeTick {
+                symbol_id,
+                price,
+                qty,
+                aggressor,
+                exchange_ts_ms: ex_ts,
+                local_ts_ms,
+                trade_id: v.get("trade_id").and_then(val_to_u64).unwrap_or(0),
+            };
+            if tick.is_valid() {
+                Some(FeedEvent::Trade(tick))
+            } else {
+                None
+            }
+        }
+        "v2/ticker" => {
+            let mark_price = v.get("mark_price").and_then(val_to_f64)?;
+            let index_price = v
+                .get("spot_price")
+                .and_then(val_to_f64)
+                .unwrap_or(mark_price);
+            let funding_rate = v.get("funding_rate").and_then(val_to_f64).unwrap_or(0.0);
+            Some(FeedEvent::FundingBasis(FundingBasisSnapshot {
+                symbol_id,
+                mark_price,
+                index_price,
+                funding_rate,
+                next_funding_ts_ms: v
+                    .get("next_funding_realization")
+                    .and_then(val_to_u64)
+                    .map(normalize_ts_ms)
+                    .unwrap_or(0),
+                local_ts_ms,
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn parse_bybit(v: &Value, symbols: &[String], local_ts_ms: u64) -> Option<FeedEvent> {
+    let topic = v.get("topic")?.as_str()?;
+    let data = v.get("data")?;
+    let ex_ts = v
+        .get("ts")
+        .and_then(val_to_u64)
+        .map(normalize_ts_ms)
+        .unwrap_or(local_ts_ms);
+
+    if topic.starts_with("orderbook.") {
+        let sym_str = data.get("s")?.as_str()?;
+        let symbol_id = resolve_symbol_id(symbols, sym_str)?;
+        let mut book = L2OrderBook {
+            symbol_id,
+            exchange_ts_ms: ex_ts,
+            local_ts_ms,
+            seq_id: data.get("seq").and_then(val_to_u64).unwrap_or(0),
+            ..Default::default()
+        };
+        if let Some(bids) = data.get("b").and_then(|x| x.as_array()) {
+            book.bid_count = fill_tuple_levels(bids, &mut book.bids);
+        }
+        if let Some(asks) = data.get("a").and_then(|x| x.as_array()) {
+            book.ask_count = fill_tuple_levels(asks, &mut book.asks);
+        }
+        return if book.is_valid() {
+            Some(FeedEvent::OrderBook(book))
+        } else {
+            None
+        };
+    }
+
+    if topic.starts_with("publicTrade.") {
+        let first = data.as_array()?.first()?;
+        let sym_str = first.get("s")?.as_str()?;
+        let symbol_id = resolve_symbol_id(symbols, sym_str)?;
+        let price = first.get("p").and_then(val_to_f64)?;
+        let qty = first.get("v").and_then(val_to_f64)?;
+        let aggressor = match first.get("S").and_then(|x| x.as_str()) {
+            Some("Buy") => Side::Buy,
+            _ => Side::Sell,
+        };
+        let tick = TradeTick {
+            symbol_id,
+            price,
+            qty,
+            aggressor,
+            exchange_ts_ms: first
+                .get("T")
+                .and_then(val_to_u64)
+                .map(normalize_ts_ms)
+                .unwrap_or(ex_ts),
+            local_ts_ms,
+            trade_id: first.get("i").and_then(val_to_u64).unwrap_or(0),
+        };
+        return if tick.is_valid() {
+            Some(FeedEvent::Trade(tick))
+        } else {
+            None
+        };
+    }
+
+    if topic.starts_with("tickers.") {
+        let sym_str = data.get("symbol")?.as_str()?;
+        let symbol_id = resolve_symbol_id(symbols, sym_str)?;
+        let mark_price = data.get("markPrice").and_then(val_to_f64)?;
+        let index_price = data
+            .get("indexPrice")
+            .and_then(val_to_f64)
+            .unwrap_or(mark_price);
+        let funding_rate = data.get("fundingRate").and_then(val_to_f64).unwrap_or(0.0);
+        return Some(FeedEvent::FundingBasis(FundingBasisSnapshot {
+            symbol_id,
+            mark_price,
+            index_price,
+            funding_rate,
+            next_funding_ts_ms: data
+                .get("nextFundingTime")
+                .and_then(val_to_u64)
+                .map(normalize_ts_ms)
+                .unwrap_or(0),
+            local_ts_ms,
+        }));
+    }
+
+    None
+}
+
+fn parse_binance(v: &Value, symbols: &[String], local_ts_ms: u64) -> Option<FeedEvent> {
+    let event_type = v.get("e")?.as_str()?;
+    let sym_str = v.get("s")?.as_str()?;
+    let symbol_id = resolve_symbol_id(symbols, sym_str)?;
+    let ex_ts = v
+        .get("E")
+        .and_then(val_to_u64)
+        .map(normalize_ts_ms)
+        .unwrap_or(local_ts_ms);
+
+    match event_type {
+        "depthUpdate" => {
+            let mut book = L2OrderBook {
+                symbol_id,
+                exchange_ts_ms: ex_ts,
+                local_ts_ms,
+                seq_id: v.get("u").and_then(val_to_u64).unwrap_or(0),
+                ..Default::default()
+            };
+            let bids_val = v.get("b").or_else(|| v.get("bids"));
+            let asks_val = v.get("a").or_else(|| v.get("asks"));
+            if let Some(bids) = bids_val.and_then(|x| x.as_array()) {
+                book.bid_count = fill_tuple_levels(bids, &mut book.bids);
+            }
+            if let Some(asks) = asks_val.and_then(|x| x.as_array()) {
+                book.ask_count = fill_tuple_levels(asks, &mut book.asks);
+            }
+            if book.is_valid() {
+                Some(FeedEvent::OrderBook(book))
+            } else {
+                None
+            }
+        }
+        "aggTrade" => {
+            let price = v.get("p").and_then(val_to_f64)?;
+            let qty = v.get("q").and_then(val_to_f64)?;
+            // On Binance, m == true means buyer is maker -> aggressor is Sell
+            let is_buyer_maker = v.get("m").and_then(|x| x.as_bool()).unwrap_or(false);
+            let aggressor = if is_buyer_maker {
+                Side::Sell
+            } else {
+                Side::Buy
+            };
+            let tick = TradeTick {
+                symbol_id,
+                price,
+                qty,
+                aggressor,
+                exchange_ts_ms: v
+                    .get("T")
+                    .and_then(val_to_u64)
+                    .map(normalize_ts_ms)
+                    .unwrap_or(ex_ts),
+                local_ts_ms,
+                trade_id: v.get("a").and_then(val_to_u64).unwrap_or(0),
+            };
+            if tick.is_valid() {
+                Some(FeedEvent::Trade(tick))
+            } else {
+                None
+            }
+        }
+        "markPriceUpdate" => {
+            let mark_price = v.get("p").and_then(val_to_f64)?;
+            let index_price = v.get("i").and_then(val_to_f64).unwrap_or(mark_price);
+            let funding_rate = v.get("r").and_then(val_to_f64).unwrap_or(0.0);
+            Some(FeedEvent::FundingBasis(FundingBasisSnapshot {
+                symbol_id,
+                mark_price,
+                index_price,
+                funding_rate,
+                next_funding_ts_ms: v
+                    .get("T")
+                    .and_then(val_to_u64)
+                    .map(normalize_ts_ms)
+                    .unwrap_or(0),
+                local_ts_ms,
+            }))
+        }
+        _ => None,
+    }
+}
