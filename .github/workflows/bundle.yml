@@ -1,0 +1,23 @@
+name: Bundle Full Code
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate HMTROBOT_FULL_CODE.txt
+        run: |
+          find . -maxdepth 4 \( -name "*.rs" -o -name "Cargo.toml" -o -name "Dockerfile" -o -name "params.toml" \) -not -path "*/target/*" | sort | while read f; do echo "================ FILE: $f ================"; cat "$f"; echo ""; done > HMTROBOT_FULL_CODE.txt
+      - name: Commit bundled file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add HMTROBOT_FULL_CODE.txt
+          git commit -m "Generate full bundled HMTROBOT_FULL_CODE.txt" || exit 0
+          git push
