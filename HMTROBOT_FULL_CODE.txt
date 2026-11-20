@@ -1,0 +1,1 @@
+find . -maxdepth 4 \( -name "*.rs" -o -name "Cargo.toml" -o -name "Dockerfile" -o -name "params.toml" \) -not -path "*/target/*" | sort | while read f; do echo "================ FILE: $f ================"; cat "$f"; echo ""; done > HMTROBOT_FULL_CODE.txt
