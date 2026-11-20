@@ -150,3 +150,164 @@ impl HmmRegimeDetector {
         self.current
     }
 }
+use crate::math_kernel::{AlphaBatch, NUM_ALPHA_ENGINES};
+
+/// Layer 2: Contextual EXP3 + Beta-Thompson Bandit across 4 Regimes x 86 Engines
+#[derive(Debug, Clone, Copy)]
+pub struct ContextualBandit86 {
+    pub weights: [[f64; NUM_ALPHA_ENGINES]; NUM_REGIMES],
+    pub alpha_hits: [[f64; NUM_ALPHA_ENGINES]; NUM_REGIMES],
+    pub beta_misses: [[f64; NUM_ALPHA_ENGINES]; NUM_REGIMES],
+    pub muted: [[bool; NUM_ALPHA_ENGINES]; NUM_REGIMES],
+    pub eta: f64,
+    pub gamma: f64,
+}
+
+impl ContextualBandit86 {
+    pub const fn new() -> Self {
+        let init_w = 1.0 / (NUM_ALPHA_ENGINES as f64);
+        Self {
+            weights: [[init_w; NUM_ALPHA_ENGINES]; NUM_REGIMES],
+            alpha_hits: [[2.0; NUM_ALPHA_ENGINES]; NUM_REGIMES],
+            beta_misses: [[2.0; NUM_ALPHA_ENGINES]; NUM_REGIMES],
+            muted: [[false; NUM_ALPHA_ENGINES]; NUM_REGIMES],
+            eta: 0.15,
+            gamma: 0.05,
+        }
+    }
+
+    /// Aggregate all unmuted, non-isolated engines into (alpha_score, confidence, active_count)
+    pub fn aggregate(
+        &self,
+        regime: AiRegime,
+        batch: &AlphaBatch,
+        isolated: &[bool; NUM_ALPHA_ENGINES],
+    ) -> (f64, f64, usize) {
+        let r = regime.index();
+        let mut weighted_score = 0.0;
+        let mut weight_sum = 0.0;
+        let mut conf_acc = 0.0;
+        let mut active = 0usize;
+
+        for i in 0..NUM_ALPHA_ENGINES {
+            if isolated[i] || self.muted[r][i] {
+                continue;
+            }
+            let sig = batch.signals[i];
+            if !sig.score.is_finite() || !sig.confidence.is_finite() || sig.confidence <= 1e-6 {
+                continue;
+            }
+            let w_exp3 = self.weights[r][i];
+            if !w_exp3.is_finite() || w_exp3 <= 1e-9 {
+                continue;
+            }
+
+            let a = self.alpha_hits[r][i];
+            let b = self.beta_misses[r][i];
+            let post_mean = (a / (a + b).max(1e-6)).clamp(0.1, 0.99);
+            let eff_w = w_exp3 * post_mean * sig.confidence;
+
+            weighted_score += eff_w * sig.score;
+            weight_sum += eff_w;
+            conf_acc += sig.confidence;
+            active += 1;
+        }
+
+        if active == 0 || weight_sum <= 1e-12 {
+            return (0.0, 0.0, 0);
+        }
+
+        let alpha = (weighted_score / weight_sum).clamp(-1.0, 1.0);
+        let conf = (conf_acc / (active as f64)).clamp(0.0, 1.0);
+        (alpha, conf, active)
+    }
+
+    /// Online EXP3 + Beta posterior update from realized post-fee return (in bps)
+    pub fn update_from_outcome(
+        &mut self,
+        regime: AiRegime,
+        prev_scores: &[f64; NUM_ALPHA_ENGINES],
+        realized_ret_bps: f64,
+        isolated: &[bool; NUM_ALPHA_ENGINES],
+    ) {
+        if !realized_ret_bps.is_finite() || realized_ret_bps.abs() < 1e-6 {
+            return;
+        }
+        let r = regime.index();
+        let mut w_sum = 0.0;
+        let mut unmuted_count = 0usize;
+
+        for i in 0..NUM_ALPHA_ENGINES {
+            if isolated[i] {
+                self.weights[r][i] = 0.0;
+                continue;
+            }
+            let s = prev_scores[i];
+            if !s.is_finite() || s.abs() < 0.05 {
+                if !self.muted[r][i] {
+                    w_sum += self.weights[r][i];
+                    unmuted_count += 1;
+                }
+                continue;
+            }
+
+            // Directional edge reward in [-1.0, 1.0]
+            let aligned = s * realized_ret_bps;
+            let reward = (aligned / 4.0).tanh().clamp(-1.0, 1.0);
+
+            // Exponentially decayed Beta posterior (adapts to non-stationary crypto)
+            self.alpha_hits[r][i] = (self.alpha_hits[r][i] * 0.985) + reward.max(0.0);
+            self.beta_misses[r][i] = (self.beta_misses[r][i] * 0.985) + (-reward).max(0.0);
+
+            let eff_obs = self.alpha_hits[r][i] + self.beta_misses[r][i];
+            let win_rate = self.alpha_hits[r][i] / eff_obs.max(1e-6);
+
+            // Auto-mute persistently failing engines to 0% weight
+            if eff_obs >= 12.0 && win_rate < 0.36 {
+                self.muted[r][i] = true;
+                self.weights[r][i] = 0.0;
+                continue;
+            }
+
+            self.muted[r][i] = false;
+            let mult = (self.eta * reward).clamp(-0.75, 0.75).exp();
+            self.weights[r][i] = (self.weights[r][i] * mult).clamp(1e-5, 10.0);
+            w_sum += self.weights[r][i];
+            unmuted_count += 1;
+        }
+
+        // Fallback self-heal: if all engines got muted, reset regime weights uniformly
+        if unmuted_count == 0 || w_sum <= 1e-12 {
+            let uniform = 1.0 / (NUM_ALPHA_ENGINES as f64);
+            for i in 0..NUM_ALPHA_ENGINES {
+                self.muted[r][i] = false;
+                self.weights[r][i] = if isolated[i] { 0.0 } else { uniform };
+            }
+            return;
+        }
+
+        // Normalize with small EXP3 exploration floor (gamma)
+        let floor = self.gamma / (unmuted_count as f64);
+        let scale = (1.0 - self.gamma) / w_sum;
+        for i in 0..NUM_ALPHA_ENGINES {
+            if !isolated[i] && !self.muted[r][i] {
+                self.weights[r][i] = (self.weights[r][i] * scale) + floor;
+            }
+        }
+    }
+
+    /// Returns 1-indexed ID of the top-weighted engine in the active regime (for HUD)
+    #[inline]
+    pub fn top_engine_id(&self, regime: AiRegime) -> u16 {
+        let r = regime.index();
+        let mut best_i = 0usize;
+        let mut best_w = -1.0;
+        for i in 0..NUM_ALPHA_ENGINES {
+            if !self.muted[r][i] && self.weights[r][i] > best_w {
+                best_w = self.weights[r][i];
+                best_i = i;
+            }
+        }
+        (best_i + 1) as u16
+    }
+}
