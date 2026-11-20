@@ -556,3 +556,222 @@ impl EngineTickInput {
         }
     }
 }
+/// Stack-only state for custom Microstructure Engines 01..15 (Zero Mutex, Zero Heap, Silent)
+#[derive(Debug, Clone, Copy)]
+pub struct Engines01To15 {
+    last_price: f64,
+    vpin_buy: f64,
+    vpin_sell: f64,
+    hawkes_lam: f64,
+    kyle_last_mid: f64,
+    kyle_lam: f64,
+    roll_prev_dp: f64,
+    roll_cov: f64,
+    ofi_pb_p: f64,
+    ofi_pb_q: f64,
+    ofi_pa_p: f64,
+    ofi_pa_q: f64,
+    ofi_smooth: f64,
+    ice_pb_p: f64,
+    ice_pb_q: f64,
+    ice_b_refill: f64,
+    ice_pa_p: f64,
+    ice_pa_q: f64,
+    ice_a_refill: f64,
+    sw_pb: f64,
+    sw_pb_v: f64,
+    sw_pa: f64,
+    sw_pa_v: f64,
+    sp_pb_v: f64,
+    sp_pa_v: f64,
+    sp_b_churn: f64,
+    sp_a_churn: f64,
+    e13_dev_bps: f64,
+    e14_pressure: f64,
+    e15_basis: f64,
+}
+
+impl Engines01To15 {
+    pub const fn new() -> Self {
+        Self {
+            last_price: 0.0,
+            vpin_buy: 0.0,
+            vpin_sell: 0.0,
+            hawkes_lam: 1.0,
+            kyle_last_mid: 0.0,
+            kyle_lam: 0.0,
+            roll_prev_dp: 0.0,
+            roll_cov: 0.0,
+            ofi_pb_p: 0.0,
+            ofi_pb_q: 0.0,
+            ofi_pa_p: 0.0,
+            ofi_pa_q: 0.0,
+            ofi_smooth: 0.0,
+            ice_pb_p: 0.0,
+            ice_pb_q: 0.0,
+            ice_b_refill: 0.0,
+            ice_pa_p: 0.0,
+            ice_pa_q: 0.0,
+            ice_a_refill: 0.0,
+            sw_pb: 0.0,
+            sw_pb_v: 0.0,
+            sw_pa: 0.0,
+            sw_pa_v: 0.0,
+            sp_pb_v: 0.0,
+            sp_pa_v: 0.0,
+            sp_b_churn: 0.0,
+            sp_a_churn: 0.0,
+            e13_dev_bps: 0.0,
+            e14_pressure: 0.0,
+            e15_basis: 0.0,
+        }
+    }
+
+    pub fn eval(&mut self, inp: &EngineTickInput, out: &mut [EngineSignal; NUM_ALPHA_ENGINES]) {
+        let price = inp.price;
+        if !price.is_finite() || price <= 0.0 {
+            return;
+        }
+        let dt = inp.dt_sec.clamp(0.001, 60.0);
+        let prev_p = self.last_price;
+        let has_prev = prev_p > 0.0;
+        let ret_bps = if has_prev { ((price - prev_p) / prev_p) * 10_000.0 } else { 0.0 };
+        let total_l1 = (inp.bid_sz + inp.ask_sz).max(1e-9);
+        let imb_l1 = ((inp.bid_sz - inp.ask_sz) / total_l1).clamp(-1.0, 1.0);
+        let mid = if inp.bid > 0.0 && inp.ask > 0.0 { (inp.bid + inp.ask) * 0.5 } else { price };
+        let micro = if inp.bid > 0.0 && inp.ask > 0.0 {
+            ((inp.bid * inp.ask_sz) + (inp.ask * inp.bid_sz)) / total_l1
+        } else {
+            mid
+        };
+
+        // E01: Microprice Baseline Anchor
+        let base_dev = if mid > 0.0 { ((micro - mid) / mid) * 10_000.0 } else { 0.0 };
+        out[0] = EngineSignal::sanitized(1, Timeframe::Sec1, tanh_s(base_dev, 2.0), if inp.has_book { 0.80 } else { 0.0 });
+
+        // E02: Scalp Burst (Stoikov Micro-Price & L1 Imbalance)
+        out[1] = EngineSignal::sanitized(2, Timeframe::Sec1, imb_l1, if inp.has_book { 0.85 } else { 0.0 });
+
+        // E03: Burst Velocity
+        out[2] = EngineSignal::sanitized(3, Timeframe::Sec1, tanh_s(ret_bps / dt, 8.0), if has_prev { 0.75 } else { 0.0 });
+
+        // E04: L2 Orderbook Wall Scanner (Top-5)
+        let tot5 = inp.top5_bid_vol + inp.top5_ask_vol;
+        let depth_ratio = if tot5 > 0.0 { (inp.top5_bid_vol - inp.top5_ask_vol) / tot5 } else { 0.0 };
+        out[3] = EngineSignal::sanitized(4, Timeframe::Sec1, depth_ratio, if inp.has_book { 0.80 } else { 0.0 });
+
+        // E05: VPIN Toxic Flow
+        if has_prev {
+            self.vpin_buy *= 0.85;
+            self.vpin_sell *= 0.85;
+            if price > prev_p {
+                self.vpin_buy += inp.bid_sz + (inp.ask_sz * 0.5);
+            } else if price < prev_p {
+                self.vpin_sell += inp.ask_sz + (inp.bid_sz * 0.5);
+            } else {
+                self.vpin_buy += inp.bid_sz * 0.5;
+                self.vpin_sell += inp.ask_sz * 0.5;
+            }
+            let tv = self.vpin_buy + self.vpin_sell;
+            let signed_vpin = if tv > 0.0 { (self.vpin_buy - self.vpin_sell) / tv } else { 0.0 };
+            out[4] = EngineSignal::sanitized(5, Timeframe::Sec1, signed_vpin, 0.80);
+        }
+
+        // E06: Hawkes Self-Exciting Intensity
+        self.hawkes_lam = 1.0 + (self.hawkes_lam - 1.0) * (-2.5 * dt).exp() + 1.8;
+        let hawkes_norm = ((self.hawkes_lam - 1.0) / 8.5).clamp(0.0, 1.0);
+        out[5] = EngineSignal::sanitized(6, Timeframe::Sec1, ret_bps.signum() * hawkes_norm, if has_prev { 0.65 } else { 0.0 });
+
+        // E07: Kyle's Lambda (Market Impact)
+        if self.kyle_last_mid > 0.0 {
+            let impact_bps = ((mid - self.kyle_last_mid).abs() / self.kyle_last_mid) * 10_000.0;
+            let net_of = (inp.bid_sz - inp.ask_sz).abs().max(1.0);
+            self.kyle_lam = (self.kyle_lam * 0.80) + (((impact_bps / net_of) * 100.0) * 0.20);
+            out[6] = EngineSignal::sanitized(7, Timeframe::Sec1, (mid - self.kyle_last_mid).signum() * tanh_s(self.kyle_lam, 0.50), 0.70);
+        }
+        self.kyle_last_mid = mid;
+
+        // E08: Roll's Model Effective Spread
+        if has_prev {
+            let dp = price - prev_p;
+            self.roll_cov = (self.roll_cov * 0.85) + ((dp * self.roll_prev_dp) * 0.15);
+            self.roll_prev_dp = dp;
+            let eff_bps = if self.roll_cov < 0.0 { (2.0 * (-self.roll_cov).sqrt() / price) * 10_000.0 } else { 0.0 };
+            let roll_score = if self.roll_cov > 0.0 {
+                tanh_s(ret_bps, 2.0)
+            } else {
+                -tanh_s(ret_bps, 2.0) * (1.0 - (eff_bps / 5.0).clamp(0.0, 0.8))
+            };
+            out[7] = EngineSignal::sanitized(8, Timeframe::Sec1, roll_score, 0.65);
+        }
+
+        // E09: Cont-Kukanov-Stoikov OFI (Top-3 Queue)
+        if inp.has_book && self.ofi_pb_p > 0.0 && self.ofi_pa_p > 0.0 {
+            let e_bid = if inp.bid > self.ofi_pb_p { inp.top3_bid_vol } else if inp.bid < self.ofi_pb_p { -self.ofi_pb_q } else { inp.top3_bid_vol - self.ofi_pb_q };
+            let e_ask = if inp.ask < self.ofi_pa_p { inp.top3_ask_vol } else if inp.ask > self.ofi_pa_p { -self.ofi_pa_q } else { inp.top3_ask_vol - self.ofi_pa_q };
+            self.ofi_smooth = (self.ofi_smooth * 0.80) + ((e_bid - e_ask) * 0.20);
+            out[8] = EngineSignal::sanitized(9, Timeframe::Sec1, tanh_s(self.ofi_smooth, 150.0), 0.85);
+        }
+        if inp.has_book {
+            self.ofi_pb_p = inp.bid; self.ofi_pb_q = inp.top3_bid_vol;
+            self.ofi_pa_p = inp.ask; self.ofi_pa_q = inp.top3_ask_vol;
+        }
+
+        // E10: Iceberg Order Sniffer
+        if inp.has_book {
+            if (inp.bid - self.ice_pb_p).abs() < 1e-5 {
+                if (inp.bid_sz - self.ice_pb_q).abs() > 1e-9 { self.ice_b_refill = (self.ice_b_refill * 0.85) + 1.0; }
+            } else { self.ice_b_refill = 0.0; }
+            if (inp.ask - self.ice_pa_p).abs() < 1e-5 {
+                if (inp.ask_sz - self.ice_pa_q).abs() > 1e-9 { self.ice_a_refill = (self.ice_a_refill * 0.85) + 1.0; }
+            } else { self.ice_a_refill = 0.0; }
+            self.ice_pb_p = inp.bid; self.ice_pb_q = inp.bid_sz;
+            self.ice_pa_p = inp.ask; self.ice_pa_q = inp.ask_sz;
+            out[9] = EngineSignal::sanitized(10, Timeframe::Sec1, tanh_s(self.ice_b_refill - self.ice_a_refill, 3.2), 0.75);
+        }
+
+        // E11: Whale Book Sweep Detector
+        if inp.has_book && self.sw_pb > 0.0 && self.sw_pa > 0.0 {
+            let ask_jump = ((inp.ask - self.sw_pa) / self.sw_pa) * 10_000.0;
+            let bid_drop = ((self.sw_pb - inp.bid) / self.sw_pb) * 10_000.0;
+            let ask_swept = if inp.ask > self.sw_pa { self.sw_pa_v } else { (self.sw_pa_v - inp.top3_ask_vol).max(0.0) };
+            let bid_swept = if inp.bid < self.sw_pb { self.sw_pb_v } else { (self.sw_pb_v - inp.top3_bid_vol).max(0.0) };
+            let sweep = tanh_s(ask_jump.max(0.0) * (ask_swept / 50.0) - bid_drop.max(0.0) * (bid_swept / 50.0), 1.5);
+            out[10] = EngineSignal::sanitized(11, Timeframe::Sec1, sweep, 0.80);
+        }
+        if inp.has_book {
+            self.sw_pb = inp.bid; self.sw_pb_v = inp.top3_bid_vol;
+            self.sw_pa = inp.ask; self.sw_pa_v = inp.top3_ask_vol;
+        }
+
+        // E12: Spoofing & Cancellation Filter
+        if inp.has_book && self.sp_pb_v > 0.0 && self.sp_pa_v > 0.0 {
+            let bid_pulled = (self.sp_pb_v - inp.top5_bid_vol).max(0.0) / self.sp_pb_v;
+            let ask_pulled = (self.sp_pa_v - inp.top5_ask_vol).max(0.0) / self.sp_pa_v;
+            self.sp_b_churn = (self.sp_b_churn * 0.75) + (bid_pulled * 0.25);
+            self.sp_a_churn = (self.sp_a_churn * 0.75) + (ask_pulled * 0.25);
+            out[11] = EngineSignal::sanitized(12, Timeframe::Sec1, tanh_s(self.sp_a_churn - self.sp_b_churn, 0.35), 0.70);
+        }
+        if inp.has_book { self.sp_pb_v = inp.top5_bid_vol; self.sp_pa_v = inp.top5_ask_vol; }
+
+        // E13: Micro-Price Deviation & Fair-Value Skew
+        let spread = (inp.ask - inp.bid).max(1e-8);
+        let raw_dev = micro - mid;
+        let dev_bps = if mid > 0.0 { (raw_dev / mid) * 10_000.0 } else { 0.0 };
+        self.e13_dev_bps = (self.e13_dev_bps * 0.75) + (dev_bps * 0.25);
+        out[12] = EngineSignal::sanitized(13, Timeframe::Sec1, (raw_dev / (spread * 0.5)).clamp(-1.0, 1.0), if inp.has_book { 0.80 } else { 0.0 });
+
+        // E14: Time-Weighted Pressure Decay
+        self.e14_pressure = (self.e14_pressure * 0.80) + (imb_l1 * 0.20);
+        out[13] = EngineSignal::sanitized(14, Timeframe::Sec1, tanh_s(self.e14_pressure, 0.35), if inp.has_book { 0.75 } else { 0.0 });
+
+        // E15: Funding Rate & Mark-to-Spot Basis
+        if inp.spot_price > 0.0 {
+            let raw_basis = ((price - inp.spot_price) / inp.spot_price) * 10_000.0;
+            self.e15_basis = (self.e15_basis * 0.80) + (raw_basis * 0.20);
+            out[14] = EngineSignal::sanitized(15, Timeframe::Min1, -tanh_s(self.e15_basis + (inp.funding_rate * 50_000.0), 15.0), 0.70);
+        }
+
+        self.last_price = price;
+    }
+}
