@@ -482,3 +482,196 @@ impl SelfHealingWatchdog {
         self.safe_mode = self.feed_stale || self.daily_loss_breached || too_many_faults;
     }
 }
+/// Unified 3-Layer Pure-Rust Adaptive AI Router (Zero GPU, Zero Heap, Zero Panic)
+#[derive(Debug, Clone, Copy)]
+pub struct AiRouter {
+    pub hmm: HmmRegimeDetector,
+    pub bandit: ContextualBandit86,
+    pub rl: ActorCriticController,
+    pub watchdog: SelfHealingWatchdog,
+    prev_scores: [f64; NUM_ALPHA_ENGINES],
+    has_prev_scores: bool,
+    last_regime: AiRegime,
+    last_decision_ms: u64,
+}
+
+impl AiRouter {
+    pub const fn new(stale_limit_ms: u64, max_daily_loss_pct: f64) -> Self {
+        Self {
+            hmm: HmmRegimeDetector::new(),
+            bandit: ContextualBandit86::new(),
+            rl: ActorCriticController::new(),
+            watchdog: SelfHealingWatchdog::new(stale_limit_ms, max_daily_loss_pct),
+            prev_scores: [0.0; NUM_ALPHA_ENGINES],
+            has_prev_scores: false,
+            last_regime: AiRegime::CalmRange,
+            last_decision_ms: 0,
+        }
+    }
+
+    /// Primary hot-path tick evaluation: 86-Engine Batch -> Regime -> Bandit -> RL -> Watchdog
+    pub fn route(
+        &mut self,
+        batch: &AlphaBatch,
+        vol_bps: f64,
+        mtf_trend: f64,
+        spread_bps: f64,
+        realized_ret_bps: f64,
+        now_ms: u64,
+        last_feed_ms: u64,
+    ) -> AiDecision {
+        // 1. Watchdog health & NaN/Inf fault isolation
+        let safe_mode = self.watchdog.check_feed_health(now_ms, last_feed_ms);
+        self.watchdog.inspect_batch(batch);
+
+        // 2. Online Bandit weight update from previous tick's realized return
+        if self.has_prev_scores {
+            self.bandit.update_from_outcome(
+                self.last_regime,
+                &self.prev_scores,
+                realized_ret_bps,
+                &self.watchdog.isolated,
+            );
+        }
+
+        // 3. Layer 1: HMM 4-state regime classification
+        let regime = self
+            .hmm
+            .update(vol_bps, mtf_trend.abs(), spread_bps, batch.dispersion);
+
+        // 4. Snapshot current scores for next-tick online Bandit learning
+        for i in 0..NUM_ALPHA_ENGINES {
+            let s = batch.signals[i].score;
+            self.prev_scores[i] = if s.is_finite() { s.clamp(-1.0, 1.0) } else { 0.0 };
+        }
+        self.has_prev_scores = true;
+        self.last_regime = regime;
+        self.last_decision_ms = now_ms;
+
+        let isolated_engines = self.watchdog.isolated_count();
+        if safe_mode || self.watchdog.safe_mode {
+            return AiDecision {
+                symbol_id: batch.symbol_id,
+                regime,
+                regime_probs: self.hmm.probs,
+                alpha_score: 0.0,
+                confidence: 0.0,
+                kelly_fraction: 0.0,
+                sl_mult: 1.0,
+                tp_skew: 1.0,
+                safe_mode: true,
+                active_engines: 0,
+                isolated_engines,
+            };
+        }
+
+        // 5. Layer 2: Contextual Bandit weighted ensemble across active unmuted engines
+        let (alpha_score, confidence, active_engines) =
+            self.bandit.aggregate(regime, batch, &self.watchdog.isolated);
+
+        // 6. Layer 3: Online Actor-Critic RL policy (Kelly, SL width, TP skew)
+        let (raw_kelly, sl_mult, tp_skew) = self.rl.policy(regime, self.watchdog.size_scale);
+        let kelly_fraction = if regime == AiRegime::ToxicCrisis {
+            0.0
+        } else {
+            raw_kelly
+        };
+
+        AiDecision {
+            symbol_id: batch.symbol_id,
+            regime,
+            regime_probs: self.hmm.probs,
+            alpha_score,
+            confidence,
+            kelly_fraction,
+            sl_mult,
+            tp_skew,
+            safe_mode: false,
+            active_engines,
+            isolated_engines,
+        }
+    }
+
+    /// Feed realized post-fee trade PnL into RL Controller and Drawdown Watchdog
+    pub fn on_trade_closed(
+        &mut self,
+        entry_regime: AiRegime,
+        post_fee_pnl_bps: f64,
+        daily_pnl_pct: f64,
+        hit_sl: bool,
+        hit_tp: bool,
+    ) {
+        self.rl
+            .update_from_trade(entry_regime, post_fee_pnl_bps, hit_sl, hit_tp);
+        self.watchdog
+            .record_trade_outcome(post_fee_pnl_bps, daily_pnl_pct);
+    }
+
+    #[inline]
+    pub fn top_engine_id(&self) -> u16 {
+        self.bandit.top_engine_id(self.last_regime)
+    }
+
+    #[inline]
+    pub fn is_safe_mode(&self) -> bool {
+        self.watchdog.safe_mode
+    }
+}
+
+#[cfg(test)]
+mod ai_router_tests {
+    use super::*;
+
+    #[test]
+    fn test_hmm_detects_calm_and_toxic_regimes() {
+        let mut hmm = HmmRegimeDetector::new();
+        let mut r = AiRegime::CalmRange;
+        for _ in 0..8 {
+            r = hmm.update(0.6, 0.1, 0.3, 0.2);
+        }
+        assert_eq!(r, AiRegime::CalmRange);
+
+        for _ in 0..8 {
+            r = hmm.update(15.0, 0.2, 6.0, 0.9);
+        }
+        assert_eq!(r, AiRegime::ToxicCrisis);
+    }
+
+    #[test]
+    fn test_bandit_mutes_consistently_wrong_engine() {
+        let mut bandit = ContextualBandit86::new();
+        let isolated = [false; NUM_ALPHA_ENGINES];
+        let mut scores = [0.0; NUM_ALPHA_ENGINES];
+        scores[0] = 0.9;  // Always right
+        scores[1] = -0.9; // Always wrong
+
+        for _ in 0..25 {
+            bandit.update_from_outcome(AiRegime::Trending, &scores, 3.0, &isolated);
+        }
+
+        let r = AiRegime::Trending.index();
+        assert!(bandit.muted[r][1]);
+        assert_eq!(bandit.weights[r][1], 0.0);
+        assert!(!bandit.muted[r][0]);
+        assert!(bandit.weights[r][0] > 0.0);
+    }
+
+    #[test]
+    fn test_watchdog_stale_feed_and_loss_streak_halving() {
+        let mut router = AiRouter::new(3_000, 2.5);
+        assert!(!router.is_safe_mode());
+
+        // Consecutive losses halve size_scale
+        router.on_trade_closed(AiRegime::CalmRange, -5.0, -0.5, true, false);
+        assert!((router.watchdog.size_scale - 0.5).abs() < 1e-6);
+
+        // Stale feed (>3000ms) triggers Safe-Mode
+        assert!(router.watchdog.check_feed_health(10_000, 6_000));
+        assert!(router.is_safe_mode());
+
+        // Daily loss breach locks Safe-Mode even if feed recovers
+        router.on_trade_closed(AiRegime::CalmRange, -10.0, -3.0, true, false);
+        assert!(router.watchdog.check_feed_health(10_500, 10_400));
+        assert!(router.is_safe_mode());
+    }
+}
