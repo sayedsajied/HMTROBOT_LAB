@@ -127,3 +127,257 @@ pub fn spawn_health_server(port: u16, health: Arc<HealthState>) -> tokio::task::
 }
 
 fn main() {}
+use crate::ai_router::{AiRegime, AiRouter};
+use crate::execution::{ExecutionEngine, ExecutionMode, FillEvent, PaperSimConfig};
+use crate::math_kernel::MathKernel;
+use crate::risk::{RiskConfig, RiskEngine, RiskRejectReason};
+use crate::sniper_strategy::{SniperStrategy, StrategyConfig};
+use crate::telegram_hud::{HudEvent, TelegramHudHandle};
+use crate::types::{FundingBasisSnapshot, L2OrderBook, SymbolId};
+use crate::vault::{ExchangeAccountTruth, ExchangeReconciler, VaultLedger};
+use std::path::PathBuf;
+
+/// Master Zero-Panic Orchestrator for BTC (0), ETH (1), and SOL (2)
+pub struct BotEngine {
+    pub kernels: [MathKernel; NUM_PAIRS],
+    pub routers: [AiRouter; NUM_PAIRS],
+    pub strategies: [SniperStrategy; NUM_PAIRS],
+    pub risk: RiskEngine,
+    pub exec: ExecutionEngine,
+    pub vault: VaultLedger,
+    pub reconciler: ExchangeReconciler,
+    pub hud: TelegramHudHandle,
+    pub health: Arc<HealthState>,
+    pub vault_path: PathBuf,
+    pub journal_path: PathBuf,
+    entry_regimes: [AiRegime; NUM_PAIRS],
+    last_feed_ms: [u64; NUM_PAIRS],
+    last_heartbeat_hud_ms: u64,
+    last_utc_day: u64,
+}
+
+impl BotEngine {
+    pub fn new(
+        mode: ExecutionMode,
+        initial_capital_usd: f64,
+        vault_path: PathBuf,
+        journal_path: PathBuf,
+        hud: TelegramHudHandle,
+        health: Arc<HealthState>,
+    ) -> Self {
+        let vault = VaultLedger::load_or_init(&vault_path, initial_capital_usd);
+        let risk_cfg = RiskConfig::default_crypto();
+        let strat_cfg = StrategyConfig::default_crypto();
+        let now = now_epoch_ms();
+
+        Self {
+            kernels: [MathKernel::new(); NUM_PAIRS],
+            routers: [AiRouter::new(3_000, risk_cfg.max_daily_loss_pct); NUM_PAIRS],
+            strategies: [SniperStrategy::new(strat_cfg); NUM_PAIRS],
+            risk: RiskEngine::new(risk_cfg),
+            exec: ExecutionEngine::new(mode, PaperSimConfig::default_crypto()),
+            vault,
+            reconciler: ExchangeReconciler::default_30s(),
+            hud,
+            health,
+            vault_path,
+            journal_path,
+            entry_regimes: [AiRegime::CalmRange; NUM_PAIRS],
+            last_feed_ms: [now; NUM_PAIRS],
+            last_heartbeat_hud_ms: now,
+            last_utc_day: now / 86_400_000,
+        }
+    }
+
+    fn process_fill(&mut self, fill: &FillEvent, idx: usize) {
+        let outcome = self.vault.apply_fill(fill);
+        let regime = self.entry_regimes[idx];
+
+        if outcome.closed_position {
+            self.routers[idx].on_trade_closed(
+                regime,
+                outcome.post_fee_pnl_bps,
+                outcome.daily_pnl_pct,
+                outcome.is_hard_sl,
+                outcome.is_take_profit,
+            );
+        }
+
+        let _ = self.vault.save_atomic(&self.vault_path);
+        if let Some(entry) = self.vault.latest_journal_entry() {
+            let _ = VaultLedger::append_journal_csv(&self.journal_path, entry);
+        }
+
+        self.hud.try_send(HudEvent::TradeFill {
+            symbol_id: fill.symbol_id,
+            direction: fill.direction,
+            fill_qty: fill.fill_qty,
+            fill_price: fill.fill_price,
+            fee_usd: fill.fee_usd,
+            realized_pnl_usd: outcome.realized_pnl_usd,
+            post_fee_pnl_bps: outcome.post_fee_pnl_bps,
+            is_maker: fill.is_maker,
+            is_hard_sl: fill.is_hard_sl,
+            is_take_profit: fill.is_take_profit,
+            regime,
+            top_engine_id: self.routers[idx].top_engine_id(),
+        });
+    }
+
+    /// Single-symbol hot-path tick: L2 + Funding -> 86 Engines -> 3-Layer AI -> Strategy -> Risk -> Exec -> Vault
+    pub fn on_market_snapshot(
+        &mut self,
+        symbol_id: SymbolId,
+        book: &L2OrderBook,
+        fb: &FundingBasisSnapshot,
+        now_ms: u64,
+    ) {
+        let idx = symbol_id.0 as usize;
+        if idx >= NUM_PAIRS || !book.is_valid() {
+            return;
+        }
+        let (bid, ask) = match (book.best_bid(), book.best_ask()) {
+            (Some(b), Some(a))
+                if b.price.is_finite()
+                    && a.price.is_finite()
+                    && b.price > 0.0
+                    && a.price > b.price =>
+            {
+                (b.price, a.price)
+            }
+            _ => return,
+        };
+
+        let utc_day = now_ms / 86_400_000;
+        if utc_day > self.last_utc_day {
+            self.last_utc_day = utc_day;
+            self.vault.on_utc_day_rollover();
+            self.risk.on_utc_day_rollover();
+        }
+
+        let mid = (bid + ask) * 0.5;
+        let spread_bps = ((ask - bid) / mid) * 10_000.0;
+        self.last_feed_ms[idx] = now_ms;
+        self.risk.on_heartbeat(now_ms);
+        self.vault.update_mark_price(symbol_id, mid, now_ms);
+
+        let tick_exec = self.exec.on_market_tick(symbol_id, bid, ask, now_ms);
+        for i in 0..tick_exec.fill_count {
+            if let Some(fill) = tick_exec.fills[i] {
+                self.process_fill(&fill, idx);
+            }
+        }
+
+        let btc_ret = self.kernels[0].last_ret_bps;
+        let batch = self.kernels[idx].on_snapshot(symbol_id, book, fb, btc_ret, now_ms);
+        let vol_bps = self.kernels[idx].ewma_vol_bps;
+        let mtf_trend = self.kernels[idx].mtf_trend_alignment();
+        let ret_bps = self.kernels[idx].last_ret_bps;
+
+        let decision = self.routers[idx].route(
+            &batch,
+            vol_bps,
+            mtf_trend,
+            spread_bps,
+            ret_bps,
+            now_ms,
+            self.last_feed_ms[idx],
+        );
+
+        let has_open = self.exec.osm.active_count_for(symbol_id) > 0;
+        let inv = self.vault.inventory_state(symbol_id, has_open);
+        let intent = self.strategies[idx].evaluate(&decision, &batch, book, &inv, vol_bps);
+
+        let snap = self.vault.to_risk_snapshot(self.exec.osm.total_active_count() as u32);
+        let verdict = self.risk.evaluate(&intent, &inv, &snap, now_ms);
+
+        if !verdict.approved
+            && matches!(
+                verdict.reject_reason,
+                RiskRejectReason::KillSwitchActive
+                    | RiskRejectReason::DeadManSwitchTripped
+                    | RiskRejectReason::DailyLossLimitBreached
+                    | RiskRejectReason::MaxDrawdownBreached
+                    | RiskRejectReason::ConsecutiveRejectsTripped
+            )
+        {
+            self.hud.try_send(HudEvent::RiskAlert {
+                symbol_id,
+                reason: verdict.reject_reason,
+                safe_mode: true,
+                daily_pnl_pct: self.vault.daily_pnl_pct(),
+            });
+        }
+
+        let is_reduce = RiskEngine::is_risk_reducing(intent.direction, &inv);
+        if verdict.approved && !is_reduce {
+            self.entry_regimes[idx] = decision.regime;
+        }
+        let exec_out = self.exec.execute_intent(&intent, &verdict, bid, ask, is_reduce, now_ms);
+        for i in 0..exec_out.fill_count {
+            if let Some(fill) = exec_out.fills[i] {
+                self.process_fill(&fill, idx);
+            }
+        }
+
+        let any_safe = self.routers[0].is_safe_mode()
+            || self.routers[1].is_safe_mode()
+            || self.routers[2].is_safe_mode()
+            || self.risk.breaker.is_halted();
+        self.health.record_tick(
+            now_ms,
+            self.vault.total_equity_usd(),
+            self.vault.total_closed_trades,
+            any_safe,
+        );
+    }
+
+    /// Periodic 30s Exchange-vs-Vault Reconciliation hook (Wintermute Rule #11)
+    pub fn on_exchange_sync(&mut self, truth: &ExchangeAccountTruth, now_ms: u64) {
+        if !self.reconciler.is_sync_due(now_ms) {
+            return;
+        }
+        let rep = self.reconciler.reconcile(&mut self.vault, truth, now_ms);
+        let _ = self.vault.save_atomic(&self.vault_path);
+        if rep.severe_drift_detected || rep.positions_corrected > 0 {
+            self.hud.try_send(HudEvent::ReconcileAlert {
+                balance_drift_usd: rep.balance_drift_usd,
+                positions_corrected: rep.positions_corrected,
+                severe: rep.severe_drift_detected,
+            });
+        }
+    }
+
+    /// Periodic Telegram HUD summary (every heartbeat_interval_ms)
+    pub fn maybe_emit_hud_heartbeat(&mut self, now_ms: u64, interval_ms: u64) {
+        if now_ms.saturating_sub(self.last_heartbeat_hud_ms) < interval_ms {
+            return;
+        }
+        self.last_heartbeat_hud_ms = now_ms;
+        let any_safe = self.routers[0].is_safe_mode() || self.risk.breaker.is_halted();
+        self.hud.try_send(HudEvent::HeartbeatSummary {
+            mode: self.exec.mode,
+            equity_usd: self.vault.total_equity_usd(),
+            daily_pnl_pct: self.vault.daily_pnl_pct(),
+            gross_exposure_usd: self.vault.total_gross_exposure_usd(),
+            closed_trades: self.vault.total_closed_trades,
+            winning_trades: self.vault.winning_trades,
+            regime: self.routers[0].hmm.current,
+            top_engine_id: self.routers[0].top_engine_id(),
+            safe_mode: any_safe,
+        });
+    }
+
+    /// Graceful SIGTERM shutdown: Cancel-All active orders + Atomic Vault Save + HUD Notice
+    pub fn graceful_shutdown(&mut self, now_ms: u64) {
+        self.health.running.store(false, Ordering::Relaxed);
+        let out = self.exec.cancel_all_global(now_ms);
+        let _ = self.vault.save_atomic(&self.vault_path);
+        self.hud.try_send(HudEvent::Shutdown {
+            equity_usd: self.vault.total_equity_usd(),
+            cancelled_orders: out.cancelled_count,
+        });
+    }
+}
+
+fn main() {}
