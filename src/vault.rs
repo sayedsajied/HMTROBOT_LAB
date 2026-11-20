@@ -637,3 +637,298 @@ impl ExchangeReconciler {
         report
     }
 }
+use std::fmt::Write as FmtWrite;
+use std::fs::{self, OpenOptions};
+use std::io::Write as IoWrite;
+use std::path::{Path, PathBuf};
+
+impl VaultLedger {
+    /// Serializes ledger & open positions into a deterministic, human-readable text snapshot
+    pub fn serialize_snapshot(&self) -> String {
+        let mut out = String::with_capacity(512);
+        let _ = writeln!(out, "v=1");
+        let _ = writeln!(out, "cash={:.8}", self.cash_balance_usd);
+        let _ = writeln!(out, "day_start={:.8}", self.day_start_equity_usd);
+        let _ = writeln!(out, "peak={:.8}", self.peak_equity_usd);
+        let _ = writeln!(out, "realized={:.8}", self.total_realized_pnl_usd);
+        let _ = writeln!(out, "fees={:.8}", self.total_fees_usd);
+        let _ = writeln!(out, "closed={}", self.total_closed_trades);
+        let _ = writeln!(out, "wins={}", self.winning_trades);
+        let _ = writeln!(out, "next_seq={}", self.next_seq);
+
+        for idx in 0..MAX_VAULT_SYMBOLS {
+            let p = &self.positions[idx];
+            if p.is_open() || p.realized_pnl_usd.abs() > 1e-12 || p.fees_paid_usd > 1e-12 {
+                let _ = writeln!(
+                    out,
+                    "pos={},{:.10},{:.8},{:.8},{:.8},{:.8},{}",
+                    idx,
+                    p.net_qty,
+                    p.avg_entry_price,
+                    p.last_mark_price,
+                    p.realized_pnl_usd,
+                    p.fees_paid_usd,
+                    p.updated_ms
+                );
+            }
+        }
+        out
+    }
+
+    /// Parses a persisted snapshot safely (ignores malformed/NaN lines, zero panic)
+    pub fn deserialize_snapshot(raw: &str, fallback_capital_usd: f64) -> Self {
+        let mut ledger = Self::new(fallback_capital_usd);
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let (key, val) = match trimmed.split_once('=') {
+                Some(pair) => pair,
+                None => continue,
+            };
+
+            match key {
+                "cash" => {
+                    if let Ok(v) = val.parse::<f64>() {
+                        if v.is_finite() && v >= 0.0 {
+                            ledger.cash_balance_usd = v;
+                        }
+                    }
+                }
+                "day_start" => {
+                    if let Ok(v) = val.parse::<f64>() {
+                        if v.is_finite() && v > 0.0 {
+                            ledger.day_start_equity_usd = v;
+                        }
+                    }
+                }
+                "peak" => {
+                    if let Ok(v) = val.parse::<f64>() {
+                        if v.is_finite() && v > 0.0 {
+                            ledger.peak_equity_usd = v;
+                        }
+                    }
+                }
+                "realized" => {
+                    if let Ok(v) = val.parse::<f64>() {
+                        if v.is_finite() {
+                            ledger.total_realized_pnl_usd = v;
+                        }
+                    }
+                }
+                "fees" => {
+                    if let Ok(v) = val.parse::<f64>() {
+                        if v.is_finite() && v >= 0.0 {
+                            ledger.total_fees_usd = v;
+                        }
+                    }
+                }
+                "closed" => {
+                    if let Ok(v) = val.parse::<u64>() {
+                        ledger.total_closed_trades = v;
+                    }
+                }
+                "wins" => {
+                    if let Ok(v) = val.parse::<u64>() {
+                        ledger.winning_trades = v;
+                    }
+                }
+                "next_seq" => {
+                    if let Ok(v) = val.parse::<u64>() {
+                        if v > 0 {
+                            ledger.next_seq = v;
+                        }
+                    }
+                }
+                "pos" => {
+                    let mut parts = val.split(',');
+                    let idx = match parts.next().and_then(|s| s.parse::<usize>().ok()) {
+                        Some(i) if i < MAX_VAULT_SYMBOLS => i,
+                        _ => continue,
+                    };
+                    let net_qty = parts.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let avg_entry = parts.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let last_mark = parts.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let realized = parts.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let fees = parts.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let updated_ms = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+
+                    if net_qty.is_finite()
+                        && avg_entry.is_finite()
+                        && last_mark.is_finite()
+                        && realized.is_finite()
+                        && fees.is_finite()
+                    {
+                        ledger.positions[idx] = PositionRecord {
+                            symbol_id: SymbolId(idx as u16),
+                            net_qty,
+                            avg_entry_price: avg_entry.max(0.0),
+                            last_mark_price: last_mark.max(0.0),
+                            realized_pnl_usd: realized,
+                            fees_paid_usd: fees.max(0.0),
+                            updated_ms,
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+        ledger
+    }
+
+    /// Atomic write (.tmp -> rename) so crash mid-write never corrupts persisted state
+    pub fn save_atomic(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let mut tmp_os = path.as_os_str().to_os_string();
+        tmp_os.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_os);
+
+        let payload = self.serialize_snapshot();
+        {
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(payload.as_bytes())?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp_path, path)
+    }
+
+    /// Crash/Restart state recovery: loads persisted vault or falls back cleanly
+    pub fn load_or_init(path: &Path, fallback_capital_usd: f64) -> Self {
+        match fs::read_to_string(path) {
+            Ok(raw) if !raw.trim().is_empty() => Self::deserialize_snapshot(&raw, fallback_capital_usd),
+            _ => Self::new(fallback_capital_usd),
+        }
+    }
+
+    /// Appends a single trade fill record to a durable CSV trade journal on disk
+    pub fn append_journal_csv(path: &Path, entry: &TradeJournalEntry) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let write_header = !path.exists();
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        if write_header {
+            writeln!(
+                file,
+                "seq,client_order_id,symbol_id,dir,fill_qty,fill_price,fee_usd,realized_pnl_usd,post_fee_pnl_bps,is_maker,is_hard_sl,is_tp,timestamp_ms"
+            )?;
+        }
+        let dir_str = match entry.direction {
+            TradeDirection::Long => "LONG",
+            TradeDirection::Short => "SHORT",
+            TradeDirection::Flat => "FLAT",
+        };
+        writeln!(
+            file,
+            "{},{},{},{},{:.10},{:.8},{:.6},{:.6},{:.4},{},{},{},{}",
+            entry.seq,
+            entry.client_order_id,
+            entry.symbol_id.0,
+            dir_str,
+            entry.fill_qty,
+            entry.fill_price,
+            entry.fee_usd,
+            entry.realized_pnl_usd,
+            entry.post_fee_pnl_bps,
+            entry.is_maker,
+            entry.is_hard_sl,
+            entry.is_take_profit,
+            entry.timestamp_ms
+        )
+    }
+}
+
+#[cfg(test)]
+mod vault_tests {
+    use super::*;
+
+    fn mk_fill(sym: u16, dir: TradeDirection, qty: f64, px: f64, fee: f64, ts: u64) -> FillEvent {
+        FillEvent {
+            client_order_id: ts,
+            symbol_id: SymbolId(sym),
+            direction: dir,
+            fill_qty: qty,
+            fill_price: px,
+            fee_usd: fee,
+            is_maker: true,
+            is_hard_sl: false,
+            is_take_profit: false,
+            timestamp_ms: ts,
+        }
+    }
+
+    #[test]
+    fn test_vault_open_close_and_position_flip() {
+        let mut vault = VaultLedger::new(1_000.0);
+
+        // Open 0.01 BTC Long @ 90,000 (fee $0.18)
+        let o1 = vault.apply_fill(&mk_fill(0, TradeDirection::Long, 0.01, 90_000.0, 0.18, 1_000));
+        assert!(!o1.closed_position);
+        assert!((vault.cash_balance_usd - 999.82).abs() < 1e-6);
+
+        // Close 0.01 BTC Long @ 91,000 -> +$10 gross - $0.18 fee = +$9.82 net
+        let o2 = vault.apply_fill(&mk_fill(0, TradeDirection::Short, 0.01, 91_000.0, 0.18, 2_000));
+        assert!(o2.closed_position);
+        assert!((o2.realized_pnl_usd - 9.82).abs() < 1e-6);
+        assert_eq!(vault.total_closed_trades, 1);
+        assert_eq!(vault.winning_trades, 1);
+        assert!(!vault.positions[0].is_open());
+
+        // Flip test: Open 1.0 SOL Long @ 150, then Sell 2.0 SOL @ 155 -> net -1.0 SOL Short @ 155
+        vault.apply_fill(&mk_fill(2, TradeDirection::Long, 1.0, 150.0, 0.05, 3_000));
+        let o3 = vault.apply_fill(&mk_fill(2, TradeDirection::Short, 2.0, 155.0, 0.10, 4_000));
+        assert!(o3.closed_position);
+        assert!((vault.positions[2].net_qty - (-1.0)).abs() < 1e-9);
+        assert!((vault.positions[2].avg_entry_price - 155.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_exchange_reconciler_corrects_drift_and_phantom() {
+        let mut vault = VaultLedger::new(1_000.0);
+        // Local thinks we hold 0.01 BTC and 1.0 ETH (ETH is a phantom)
+        vault.apply_fill(&mk_fill(0, TradeDirection::Long, 0.01, 90_000.0, 0.0, 1_000));
+        vault.apply_fill(&mk_fill(1, TradeDirection::Long, 1.0, 3_000.0, 0.0, 1_100));
+
+        // Exchange truth: balance is 1015.0, BTC qty is 0.02, ETH is closed (not present)
+        let mut truth = ExchangeAccountTruth::empty(1_015.0, 31_000);
+        truth.push_position(SymbolId(0), 0.02, 90_200.0, 90_500.0);
+
+        let mut rec = ExchangeReconciler::default_30s();
+        assert!(rec.is_sync_due(31_000));
+        let rep = rec.reconcile(&mut vault, &truth, 31_000);
+
+        assert!(rep.severe_drift_detected);
+        assert_eq!(rep.positions_corrected, 2);
+        assert!((vault.cash_balance_usd - 1_015.0).abs() < 1e-6);
+        assert!((vault.positions[0].net_qty - 0.02).abs() < 1e-9);
+        assert!(!vault.positions[1].is_open());
+        assert!(!rec.is_sync_due(40_000));
+        assert!(rec.is_sync_due(62_000));
+    }
+
+    #[test]
+    fn test_atomic_disk_persistence_roundtrip() {
+        let mut vault = VaultLedger::new(2_500.0);
+        vault.apply_fill(&mk_fill(0, TradeDirection::Long, 0.015, 92_000.0, 0.25, 5_000));
+        vault.update_mark_price(SymbolId(0), 92_400.0, 6_000);
+
+        let path = std::env::temp_dir().join("hmtrobot_vault_test_snapshot.txt");
+        let saved = vault.save_atomic(&path);
+        assert!(saved.is_ok());
+
+        let loaded = VaultLedger::load_or_init(&path, 500.0);
+        let _ = fs::remove_file(&path);
+
+        assert!((loaded.cash_balance_usd - vault.cash_balance_usd).abs() < 1e-6);
+        assert!((loaded.peak_equity_usd - vault.peak_equity_usd).abs() < 1e-6);
+        assert!((loaded.positions[0].net_qty - 0.015).abs() < 1e-9);
+        assert!((loaded.positions[0].avg_entry_price - 92_000.0).abs() < 1e-6);
+    }
+}
