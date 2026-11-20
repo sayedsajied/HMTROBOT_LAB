@@ -171,3 +171,184 @@ impl FeeGate {
         (ExecutionStyle::None, maker_hurdle)
     }
 }
+use crate::ai_router::AiRegime;
+use crate::math_kernel::AlphaBatch;
+
+/// Snapshot of real-time adverse selection & whale-sweep danger
+#[derive(Debug, Clone, Copy)]
+pub struct ToxicFlowAssessment {
+    pub toxic_score: f64,      // [0.0, 1.0]
+    pub whale_sweep_dir: f64,  // [-1.0, 1.0] (+ buy sweep, - sell sweep)
+    pub pull_resting_orders: bool,
+    pub block_new_entries: bool,
+}
+
+/// Jump Pillar #3: Adverse Selection & Whale-Sweep Toxic Flow Shield
+#[derive(Debug, Clone, Copy)]
+pub struct ToxicFlowShield {
+    pub ewma_toxicity: f64,
+    pub pull_threshold: f64,
+    pub block_threshold: f64,
+}
+
+impl ToxicFlowShield {
+    pub const fn new() -> Self {
+        Self {
+            ewma_toxicity: 0.0,
+            pull_threshold: 0.62,
+            block_threshold: 0.72,
+        }
+    }
+
+    /// Evaluates toxicity from E05 (VPIN), E07 (Kyle), E11 (Whale Sweep), E12 (Spoof), Spread & HMM
+    pub fn evaluate(
+        &mut self,
+        batch: &AlphaBatch,
+        regime: AiRegime,
+        spread_bps: f64,
+        max_spread_bps: f64,
+    ) -> ToxicFlowAssessment {
+        let vpin = batch.signals[4].score.abs().clamp(0.0, 1.0);
+        let kyle = batch.signals[6].score.abs().clamp(0.0, 1.0);
+        let sweep_signed = batch.signals[10].score.clamp(-1.0, 1.0);
+        let sweep_abs = sweep_signed.abs();
+        let spoof_abs = batch.signals[11].score.abs().clamp(0.0, 1.0);
+
+        let sp_ratio = if spread_bps.is_finite() && max_spread_bps > 1e-6 {
+            (spread_bps / max_spread_bps).clamp(0.0, 1.5)
+        } else {
+            1.0
+        };
+        let regime_pen = match regime {
+            AiRegime::ToxicCrisis => 0.35,
+            AiRegime::VolatileBurst => 0.10,
+            _ => 0.0,
+        };
+
+        let raw_tox = ((vpin * 0.30)
+            + (sweep_abs * 0.32)
+            + (kyle * 0.14)
+            + (spoof_abs * 0.10)
+            + (sp_ratio.min(1.0) * 0.14)
+            + regime_pen)
+            .clamp(0.0, 1.0);
+
+        self.ewma_toxicity = ((self.ewma_toxicity * 0.65) + (raw_tox * 0.35)).clamp(0.0, 1.0);
+        let peak_tox = self.ewma_toxicity.max(raw_tox);
+
+        let pull_resting = peak_tox >= self.pull_threshold
+            || sweep_abs >= 0.75
+            || regime == AiRegime::ToxicCrisis;
+        let block_new = peak_tox >= self.block_threshold
+            || regime == AiRegime::ToxicCrisis
+            || sp_ratio >= 1.0;
+
+        ToxicFlowAssessment {
+            toxic_score: peak_tox,
+            whale_sweep_dir: sweep_signed,
+            pull_resting_orders: pull_resting,
+            block_new_entries: block_new,
+        }
+    }
+
+    /// True if taking/resting in `direction` directly stands in front of an opposing whale sweep
+    #[inline]
+    pub fn is_adverse_for(&self, direction: TradeDirection, assess: &ToxicFlowAssessment) -> bool {
+        match direction {
+            TradeDirection::Long => assess.whale_sweep_dir < -0.55,
+            TradeDirection::Short => assess.whale_sweep_dir > 0.55,
+            TradeDirection::Flat => false,
+        }
+    }
+}
+
+/// Jump Pillar #4: Avellaneda-Stoikov Dynamic Inventory & Quote Skew Controller
+#[derive(Debug, Clone, Copy)]
+pub struct InventorySkewModel {
+    pub gamma_risk: f64,
+    pub max_skew_bps: f64,
+}
+
+impl InventorySkewModel {
+    pub const fn new(gamma_risk: f64, max_skew_bps: f64) -> Self {
+        Self {
+            gamma_risk,
+            max_skew_bps,
+        }
+    }
+
+    /// Reservation price skew in bps: positive long inventory -> negative skew (encourages selling)
+    #[inline]
+    pub fn reservation_skew_bps(
+        &self,
+        inv: &InventoryState,
+        max_inv_usd: f64,
+        vol_bps: f64,
+    ) -> f64 {
+        let q = inv.utilization(max_inv_usd);
+        let v = if vol_bps.is_finite() { vol_bps.clamp(0.2, 25.0) } else { 1.0 };
+        let raw = -q * self.gamma_risk * v;
+        raw.clamp(-self.max_skew_bps, self.max_skew_bps)
+    }
+
+    /// Dampens size when adding to existing exposure; preserves size when reducing/flattening risk
+    #[inline]
+    pub fn adjust_size_fraction(
+        &self,
+        base_frac: f64,
+        dir: TradeDirection,
+        inv: &InventoryState,
+        max_inv_usd: f64,
+    ) -> f64 {
+        if !base_frac.is_finite() || base_frac <= 0.0 {
+            return 0.0;
+        }
+        let util = inv.utilization(max_inv_usd);
+        let adding_same_side = match dir {
+            TradeDirection::Long => util > 0.0,
+            TradeDirection::Short => util < 0.0,
+            TradeDirection::Flat => return 0.0,
+        };
+
+        if adding_same_side {
+            let headroom = (1.0 - util.abs()).clamp(0.0, 1.0);
+            (base_frac * headroom).clamp(0.0, headroom)
+        } else {
+            // Risk-reducing or flat entry
+            base_frac.clamp(0.0, 1.0)
+        }
+    }
+
+    /// Computes passive Post-Only or aggressive limit price incorporating inventory skew
+    #[inline]
+    pub fn skewed_limit_price(
+        &self,
+        mid: f64,
+        bid: f64,
+        ask: f64,
+        dir: TradeDirection,
+        style: ExecutionStyle,
+        skew_bps: f64,
+    ) -> f64 {
+        if !mid.is_finite() || mid <= 0.0 {
+            return 0.0;
+        }
+        let b = if bid.is_finite() && bid > 0.0 { bid } else { mid };
+        let a = if ask.is_finite() && ask > 0.0 { ask } else { mid };
+        let skew_mult = 1.0 + (skew_bps / 10_000.0);
+
+        match (dir, style) {
+            (TradeDirection::Long, ExecutionStyle::MakerPostOnly) => {
+                // Stay passive at or below best bid
+                (b * skew_mult).min(b)
+            }
+            (TradeDirection::Short, ExecutionStyle::MakerPostOnly) => {
+                // Stay passive at or above best ask
+                (a * skew_mult).max(a)
+            }
+            (TradeDirection::Long, ExecutionStyle::TakerAggressive | ExecutionStyle::EmergencyClose) => a,
+            (TradeDirection::Short, ExecutionStyle::TakerAggressive | ExecutionStyle::EmergencyClose) => b,
+            _ => 0.0,
+        }
+    }
+}
