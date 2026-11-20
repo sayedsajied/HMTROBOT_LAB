@@ -1101,3 +1101,361 @@ impl Engines16To30 {
         self.last_price = price;
     }
 }
+/// Stack-only state for custom Convexity, Greeks, Execution & Tail-Risk Engines 31..45
+#[derive(Debug, Clone, Copy)]
+pub struct Engines31To45 {
+    last_price: f64,
+    // E31 Taylor Convexity
+    t_p2: f64,
+    t_p1: f64,
+    t_vec: [f64; 3],
+    // E32 Lyapunov Chaos
+    ly_phase: [f64; 3],
+    ly_prev_d: f64,
+    ly_lam: f64,
+    // E33 Kolmogorov-Smirnov Regime Shift
+    ks_fast: [f64; 4],
+    ks_slow: [f64; 4],
+    // E34 Wasserstein L2 Transport
+    w_cdf: [f64; 4],
+    // E35 Hilbert Phase
+    hil_buf: [f64; 4],
+    // E36 BSM Greeks
+    bsm_k: f64,
+    bsm_sig: f64,
+    bsm_delta: f64,
+    // E37 Vanna-Volga
+    vv_k: f64,
+    vv_sig: f64,
+    vv_flow: f64,
+    // E38 Charm-Vera
+    cv_k: f64,
+    cv_sig: f64,
+    cv_tau: f64,
+    cv_bleed: f64,
+    // E39 Speed-Zomma
+    sz_k: f64,
+    sz_sig: f64,
+    sz_squeeze: f64,
+    // E40 Almgren-Chriss
+    ac_var: f64,
+    ac_kappa: f64,
+    ac_rate: f64,
+    // E41 Avellaneda-Stoikov
+    as_var: f64,
+    as_skew: f64,
+    // E42 Nash Game Theory
+    nash_p: f64,
+    nash_q: f64,
+    // E43 Lotka-Volterra
+    lv_x: f64,
+    lv_y: f64,
+    // E44 Merton-Kelly
+    kel_mu: f64,
+    kel_var: f64,
+    // E45 EVT Tail Shield
+    evt_u: f64,
+    evt_ex: f64,
+}
+
+impl Engines31To45 {
+    pub const fn new() -> Self {
+        Self {
+            last_price: 0.0,
+            t_p2: 0.0,
+            t_p1: 0.0,
+            t_vec: [0.0; 3],
+            ly_phase: [0.0; 3],
+            ly_prev_d: 0.1,
+            ly_lam: -0.05,
+            ks_fast: [0.25, 0.50, 0.75, 1.0],
+            ks_slow: [0.25, 0.50, 0.75, 1.0],
+            w_cdf: [0.25, 0.50, 0.75, 1.0],
+            hil_buf: [0.0; 4],
+            bsm_k: 0.0,
+            bsm_sig: 0.015,
+            bsm_delta: 0.5,
+            vv_k: 0.0,
+            vv_sig: 0.015,
+            vv_flow: 0.0,
+            cv_k: 0.0,
+            cv_sig: 0.015,
+            cv_tau: 1.0,
+            cv_bleed: 0.0,
+            sz_k: 0.0,
+            sz_sig: 0.015,
+            sz_squeeze: 0.0,
+            ac_var: 1.0,
+            ac_kappa: 1.0,
+            ac_rate: 0.5,
+            as_var: 1.0,
+            as_skew: 0.0,
+            nash_p: 0.5,
+            nash_q: 0.5,
+            lv_x: 1.0,
+            lv_y: 0.5,
+            kel_mu: 0.0,
+            kel_var: 1.0,
+            evt_u: 1.2,
+            evt_ex: 0.5,
+        }
+    }
+
+    pub fn eval(&mut self, inp: &EngineTickInput, out: &mut [EngineSignal; NUM_ALPHA_ENGINES]) {
+        let price = inp.price;
+        if !price.is_finite() || price <= 0.0 {
+            return;
+        }
+        let prev_p = self.last_price;
+        let has_prev = prev_p > 0.0;
+        let ret_bps = if has_prev { ((price - prev_p) / prev_p) * 10_000.0 } else { 0.0 };
+        let spread_bps = if inp.bid > 0.0 && inp.ask > inp.bid {
+            (((inp.ask - inp.bid) / price) * 10_000.0).max(0.1)
+        } else {
+            0.2
+        };
+        let top_depth = (inp.bid_sz + inp.ask_sz).max(0.1);
+        let imb_l1 = ((inp.bid_sz - inp.ask_sz) / top_depth).clamp(-1.0, 1.0);
+
+        // E31: Taylor Series 2nd-Order Convexity & Gamma Accelerator
+        if self.t_p1 > 0.0 && self.t_p2 > 0.0 {
+            let vel = ((price - self.t_p1) / self.t_p1) * 10_000.0;
+            let prev_vel = ((self.t_p1 - self.t_p2) / self.t_p2) * 10_000.0;
+            let gamma = vel - prev_vel;
+            let proj = vel + (0.5 * gamma);
+            self.t_vec[0] = (self.t_vec[0] * 0.75) + (vel * 0.25);
+            self.t_vec[1] = (self.t_vec[1] * 0.75) + (gamma * 0.25);
+            self.t_vec[2] = (self.t_vec[2] * 0.75) + (proj * 0.25);
+            out[30] = EngineSignal::sanitized(31, Timeframe::Sec1, tanh_s(self.t_vec[2], 2.5), 0.75);
+        }
+        self.t_p2 = self.t_p1;
+        self.t_p1 = price;
+
+        // E32: Largest Lyapunov Exponent (3D Phase-Space Chaos)
+        if has_prev {
+            let curr = [self.ly_phase[1], self.ly_phase[2], ret_bps];
+            let d0 = curr[0] - self.ly_phase[0];
+            let d1 = curr[1] - self.ly_phase[1];
+            let d2 = curr[2] - self.ly_phase[2];
+            let curr_d = (d0 * d0 + d1 * d1 + d2 * d2).sqrt().max(0.02);
+            let inst_lam = (curr_d / self.ly_prev_d.max(0.02)).ln().clamp(-2.0, 2.0);
+            self.ly_lam = (self.ly_lam * 0.85) + (inst_lam * 0.15);
+            self.ly_phase = curr;
+            self.ly_prev_d = curr_d;
+            let chaos_damp = (1.0 - self.ly_lam.max(0.0)).clamp(0.1, 1.0);
+            out[31] = EngineSignal::sanitized(32, Timeframe::Sec15, tanh_s(ret_bps, 2.0) * chaos_damp, 0.65);
+        }
+
+        // E33: Kolmogorov-Smirnov (K-S) Empirical Distribution Shift
+        if has_prev {
+            let step = [
+                if ret_bps <= -1.2 { 1.0 } else { 0.0 },
+                if ret_bps <= 0.0 { 1.0 } else { 0.0 },
+                if ret_bps <= 1.2 { 1.0 } else { 0.0 },
+                1.0,
+            ];
+            let mut ks_d = 0.0f64;
+            for i in 0..4 {
+                self.ks_fast[i] = (self.ks_fast[i] * 0.78) + (step[i] * 0.22);
+                self.ks_slow[i] = (self.ks_slow[i] * 0.97) + (step[i] * 0.03);
+                ks_d = ks_d.max((self.ks_fast[i] - self.ks_slow[i]).abs());
+            }
+            let dir_bias = self.ks_slow[1] - self.ks_fast[1];
+            out[32] = EngineSignal::sanitized(33, Timeframe::Sec15, tanh_s(dir_bias * (1.0 + ks_d * 2.0), 0.35), 0.75);
+        }
+
+        // E34: Wasserstein Earth-Mover's Distance (L2 Optimal Transport)
+        let tot_mass = inp.b2_sz + inp.bid_sz + inp.ask_sz + inp.a2_sz;
+        if inp.has_book && tot_mass > 0.001 {
+            let curr = [
+                inp.b2_sz / tot_mass,
+                (inp.b2_sz + inp.bid_sz) / tot_mass,
+                (inp.b2_sz + inp.bid_sz + inp.ask_sz) / tot_mass,
+                1.0,
+            ];
+            let mut w1 = 0.0;
+            let mut shift = 0.0;
+            for i in 0..3 {
+                let d = curr[i] - self.w_cdf[i];
+                w1 += d.abs();
+                shift += d;
+            }
+            for i in 0..4 {
+                self.w_cdf[i] = (self.w_cdf[i] * 0.70) + (curr[i] * 0.30);
+            }
+            out[33] = EngineSignal::sanitized(34, Timeframe::Sec1, tanh_s(shift * (1.0 + w1), 0.30), 0.75);
+        }
+
+        // E35: Discrete Hilbert Transform (Instantaneous Phase & Cycle Turn)
+        if has_prev {
+            self.hil_buf = [self.hil_buf[1], self.hil_buf[2], self.hil_buf[3], ret_bps];
+            let in_p = 0.5 * self.hil_buf[1] + 0.5 * self.hil_buf[2];
+            let quad = (-0.6366 * self.hil_buf[0])
+                + (-0.2122 * self.hil_buf[1])
+                + (0.2122 * self.hil_buf[2])
+                + (0.6366 * self.hil_buf[3]);
+            let amp = (in_p * in_p + quad * quad).sqrt();
+            let phi_deg = quad.atan2(in_p).to_degrees();
+            let cyc_dir = if phi_deg > -135.0 && phi_deg < -45.0 {
+                1.0
+            } else if phi_deg > 45.0 && phi_deg < 135.0 {
+                -1.0
+            } else {
+                0.0
+            };
+            out[34] = EngineSignal::sanitized(35, Timeframe::Sec15, cyc_dir * tanh_s(amp, 1.5), 0.65);
+        }
+
+        // E36: BSM Synthetic Delta & Vega Dealer Hedge Impulse
+        if self.bsm_k <= 0.0 {
+            self.bsm_k = price;
+        } else {
+            let ret_abs = ((price - self.bsm_k) / self.bsm_k).abs();
+            self.bsm_sig = ((self.bsm_sig * 0.90) + (ret_abs * 0.10)).max(0.0005);
+            self.bsm_k = (self.bsm_k * 0.92) + (price * 0.08);
+            let d1 = ((price / self.bsm_k).ln() + (0.5 * self.bsm_sig * self.bsm_sig)) / self.bsm_sig;
+            let syn_delta = 1.0 / (1.0 + (-1.702 * d1).exp());
+            let pdf_d1 = (-0.5 * d1 * d1).exp() * 0.39894228;
+            let syn_vega = pdf_d1 * self.bsm_sig * 10_000.0;
+            let impulse = ((syn_delta - self.bsm_delta) * 100.0) + (syn_vega * d1.signum() * 0.1);
+            self.bsm_delta = syn_delta;
+            out[35] = EngineSignal::sanitized(36, Timeframe::Sec15, tanh_s(impulse, 3.0), 0.70);
+        }
+
+        // E37: Vanna & Volga Second-Order Cross-Greek Flow
+        if self.vv_k <= 0.0 {
+            self.vv_k = price;
+        } else {
+            let ret_s = (price - self.vv_k) / self.vv_k;
+            let next_sig = ((self.vv_sig * 0.88) + (ret_s.abs() * 0.12)).max(0.0005);
+            let d_sig = next_sig - self.vv_sig;
+            self.vv_sig = next_sig;
+            self.vv_k = (self.vv_k * 0.90) + (price * 0.10);
+            let d1 = ((price / self.vv_k).ln() + (0.5 * next_sig * next_sig)) / next_sig;
+            let d2 = d1 - next_sig;
+            let pdf_d1 = (-0.5 * d1 * d1).exp() * 0.39894228;
+            let vanna = (-pdf_d1 * (d2 / next_sig)).clamp(-50.0, 50.0);
+            let flow = (vanna * d_sig * 10_000.0) + (ret_s * 1_000.0);
+            self.vv_flow = (self.vv_flow * 0.75) + (flow * 0.25);
+            out[36] = EngineSignal::sanitized(37, Timeframe::Sec15, tanh_s(self.vv_flow, 2.0), 0.70);
+        }
+
+        // E38: Charm (Delta Bleed) & Vera (Vega Decay)
+        if self.cv_k <= 0.0 {
+            self.cv_k = price;
+        } else {
+            let ret_abs = ((price - self.cv_k) / self.cv_k).abs();
+            self.cv_sig = ((self.cv_sig * 0.90) + (ret_abs * 0.10)).max(0.0005);
+            self.cv_k = (self.cv_k * 0.93) + (price * 0.07);
+            self.cv_tau = if self.cv_tau <= 0.18 { 1.0 } else { self.cv_tau - 0.04 };
+            let st = self.cv_tau.sqrt();
+            let d1 = ((price / self.cv_k).ln() + (0.5 * self.cv_sig * self.cv_sig * self.cv_tau)) / (self.cv_sig * st);
+            let d2 = d1 - (self.cv_sig * st);
+            let pdf = (-0.5 * d1 * d1).exp() * 0.39894228;
+            let charm = (pdf * (d2 / (2.0 * self.cv_tau))).clamp(-25.0, 25.0);
+            let vera = (-pdf * st * (0.5 + (d1 * d2) / (2.0 * self.cv_tau))).clamp(-25.0, 25.0);
+            self.cv_bleed = (self.cv_bleed * 0.75) + (((charm * 1.5) + (vera * 0.5)) * 0.25);
+            out[37] = EngineSignal::sanitized(38, Timeframe::Min1, tanh_s(self.cv_bleed, 1.5), 0.65);
+        }
+
+        // E39: Speed & Zomma Third-Order Gamma Squeeze
+        if self.sz_k <= 0.0 {
+            self.sz_k = price;
+        } else {
+            let ret_s = (price - self.sz_k) / self.sz_k;
+            self.sz_sig = ((self.sz_sig * 0.88) + (ret_s.abs() * 0.12)).max(0.0005);
+            self.sz_k = (self.sz_k * 0.92) + (price * 0.08);
+            let d1 = ((price / self.sz_k).ln() + (0.5 * self.sz_sig * self.sz_sig)) / self.sz_sig;
+            let d2 = d1 - self.sz_sig;
+            let pdf = (-0.5 * d1 * d1).exp() * 0.39894228;
+            let gamma = pdf / (price * self.sz_sig);
+            let speed = (-gamma / price * (d1 / self.sz_sig + 1.0) * 100_000.0).clamp(-100.0, 100.0);
+            let zomma = (gamma * (d1 * d2 - 1.0) / self.sz_sig).clamp(-50.0, 50.0);
+            let sqz = (speed * 0.6) + (zomma * 0.4) + (ret_s * 500.0);
+            self.sz_squeeze = (self.sz_squeeze * 0.70) + (sqz * 0.30);
+            out[38] = EngineSignal::sanitized(39, Timeframe::Sec15, tanh_s(self.sz_squeeze, 3.0), 0.70);
+        }
+
+        // E40: Almgren-Chriss Optimal Execution Trajectory
+        if has_prev {
+            self.ac_var = ((self.ac_var * 0.88) + (ret_bps * ret_bps * 0.12)).max(0.05);
+            let eta = (spread_bps / top_depth.sqrt()).clamp(0.05, 50.0);
+            let kappa = ((0.35 * self.ac_var) / eta).sqrt().clamp(0.1, 5.0);
+            let rate = (1.0 - ((kappa * 0.5).sinh() / kappa.sinh().max(1e-6))).clamp(0.0, 1.0);
+            self.ac_kappa = (self.ac_kappa * 0.75) + (kappa * 0.25);
+            self.ac_rate = (self.ac_rate * 0.75) + (rate * 0.25);
+            out[39] = EngineSignal::sanitized(40, Timeframe::Sec1, tanh_s(ret_bps, 2.0) * self.ac_rate, 0.70);
+        }
+
+        // E41: Avellaneda-Stoikov Reservation Price Skew
+        if has_prev {
+            self.as_var = ((self.as_var * 0.88) + (ret_bps * ret_bps * 0.12)).max(0.05);
+            let inv_q = (inp.ask_sz - inp.bid_sz) / top_depth;
+            let res_skew = -inv_q * 0.25 * self.as_var;
+            self.as_skew = (self.as_skew * 0.75) + (res_skew * 0.25);
+            out[40] = EngineSignal::sanitized(41, Timeframe::Sec1, tanh_s(self.as_skew, 0.90), 0.80);
+        }
+
+        // E42: Nash Equilibrium Bimatrix Game Theory (Predator vs Maker)
+        if has_prev {
+            let abs_r = ret_bps.abs();
+            let m11 = abs_r - (0.5 * spread_bps);
+            let m12 = -spread_bps;
+            let m21 = -0.3 * abs_r;
+            let m22 = imb_l1.abs() * 1.5;
+            let denom = (m11 - m12 - m21 + m22).abs().max(0.1);
+            let p_sw = ((m22 - m21).abs() / denom).clamp(0.05, 0.95);
+            let q_rt = ((m22 - m12).abs() / denom).clamp(0.05, 0.95);
+            self.nash_p = (self.nash_p * 0.75) + (p_sw * 0.25);
+            self.nash_q = (self.nash_q * 0.75) + (q_rt * 0.25);
+            let edge = (self.nash_p - 0.5) * 2.0;
+            out[41] = EngineSignal::sanitized(42, Timeframe::Sec1, ret_bps.signum() * edge.max(0.0), 0.70);
+        }
+
+        // E43: Lotka-Volterra Predator-Prey Liquidity Dynamics
+        if has_prev {
+            let mass = top_depth.ln().max(0.2);
+            let x = (self.lv_x * 0.80) + (mass * 0.20);
+            let y = (self.lv_y * 0.75) + (ret_bps.abs().max(0.1) * 0.25);
+            let dx = (0.40 * x) - (0.30 * x * y);
+            let dy = (0.25 * x * y) - (0.35 * y);
+            self.lv_x = (x + dx * 0.15).clamp(0.05, 15.0);
+            self.lv_y = (y + dy * 0.15).clamp(0.05, 15.0);
+            let ratio = self.lv_y / self.lv_x;
+            out[42] = EngineSignal::sanitized(43, Timeframe::Sec1, ret_bps.signum() * tanh_s(ratio - 1.0, 1.2), 0.65);
+        }
+
+        // E44: Continuous-Time Merton-Kelly Optimal Leverage
+        if has_prev {
+            self.kel_mu = (self.kel_mu * 0.85) + (ret_bps * 0.15);
+            let d = ret_bps - self.kel_mu;
+            self.kel_var = ((self.kel_var * 0.85) + (d * d * 0.15)).max(0.10);
+            let net_edge = if self.kel_mu.abs() > 0.15 {
+                self.kel_mu.signum() * (self.kel_mu.abs() - 0.15)
+            } else {
+                0.0
+            };
+            let half_kelly = (0.5 * (net_edge / self.kel_var)).clamp(-5.0, 5.0);
+            out[43] = EngineSignal::sanitized(44, Timeframe::Sec15, tanh_s(half_kelly, 1.5), 0.75);
+        }
+
+        // E45: Extreme Value Theory (EVT) Generalized Pareto Tail Shield
+        if has_prev {
+            let abs_r = ret_bps.abs();
+            self.evt_u = ((self.evt_u * 0.92) + (abs_r * 0.12)).clamp(0.4, 8.0);
+            let excess = (abs_r - self.evt_u).max(0.0);
+            self.evt_ex = if excess > 0.0 {
+                (self.evt_ex * 0.80) + (excess * 0.20)
+            } else {
+                (self.evt_ex * 0.96).max(0.15)
+            };
+            let xi = ((self.evt_ex / (self.evt_u + self.evt_ex)) * 0.65).clamp(0.05, 0.45);
+            let beta = (self.evt_ex * (1.0 - xi)).max(0.1);
+            let var_99 = self.evt_u + (beta / xi) * ((10.0_f64).powf(xi) - 1.0);
+            let tail_safe = if abs_r > var_99 || xi > 0.32 { 0.15 } else { 1.0 };
+            out[44] = EngineSignal::sanitized(45, Timeframe::Sec1, tanh_s(ret_bps, 2.5) * tail_safe, 0.70);
+        }
+
+        self.last_price = price;
+    }
+}
