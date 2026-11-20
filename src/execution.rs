@@ -556,3 +556,429 @@ pub struct LiveDispatchCommand {
     pub reduce_only: bool,
     pub created_ms: u64,
 }
+use crate::risk::RiskVerdict;
+use crate::sniper_strategy::StrategyIntent;
+
+pub const MAX_EXEC_SYMBOLS: usize = 8;
+pub const MAX_STEP_EVENTS: usize = 8;
+
+/// Zero-allocation output returned by ExecutionEngine on every order or market tick
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutionOutput {
+    pub fills: [Option<FillEvent>; MAX_STEP_EVENTS],
+    pub fill_count: usize,
+    pub live_cmds: [Option<LiveDispatchCommand>; MAX_STEP_EVENTS],
+    pub cmd_count: usize,
+    pub submitted_order_id: Option<u64>,
+    pub cancelled_count: usize,
+}
+
+impl ExecutionOutput {
+    pub const fn empty() -> Self {
+        Self {
+            fills: [None; MAX_STEP_EVENTS],
+            fill_count: 0,
+            live_cmds: [None; MAX_STEP_EVENTS],
+            cmd_count: 0,
+            submitted_order_id: None,
+            cancelled_count: 0,
+        }
+    }
+
+    #[inline]
+    pub fn push_fill(&mut self, fill: FillEvent) {
+        if self.fill_count < MAX_STEP_EVENTS {
+            self.fills[self.fill_count] = Some(fill);
+            self.fill_count += 1;
+        }
+    }
+
+    #[inline]
+    pub fn push_cmd(&mut self, cmd: LiveDispatchCommand) {
+        if self.cmd_count < MAX_STEP_EVENTS {
+            self.live_cmds[self.cmd_count] = Some(cmd);
+            self.cmd_count += 1;
+        }
+    }
+}
+
+/// Master Execution Engine: 100% Paper-to-Live Parity, Deterministic OSM & Hard SL Brackets
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutionEngine {
+    pub mode: ExecutionMode,
+    pub osm: OrderStateMachine,
+    pub paper: PaperSimulator,
+    brackets: [StopBracket; MAX_EXEC_SYMBOLS],
+}
+
+impl ExecutionEngine {
+    pub const fn new(mode: ExecutionMode, paper_cfg: PaperSimConfig) -> Self {
+        Self {
+            mode,
+            osm: OrderStateMachine::new(),
+            paper: PaperSimulator::new(paper_cfg),
+            brackets: [StopBracket::inactive(SymbolId(0)); MAX_EXEC_SYMBOLS],
+        }
+    }
+
+    #[inline]
+    fn bracket_index(symbol_id: SymbolId) -> Option<usize> {
+        let idx = symbol_id.0 as usize;
+        if idx < MAX_EXEC_SYMBOLS {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn bracket_for(&self, symbol_id: SymbolId) -> Option<&StopBracket> {
+        Self::bracket_index(symbol_id).map(|i| &self.brackets[i])
+    }
+
+    fn arm_bracket_from_order(&mut self, ord: &ExecOrder, filled_qty: f64) {
+        if ord.is_reduce_only || ord.stop_loss_price <= 0.0 {
+            if let Some(i) = Self::bracket_index(ord.symbol_id) {
+                if ord.is_reduce_only {
+                    self.brackets[i].disarm();
+                }
+            }
+            return;
+        }
+        if let Some(i) = Self::bracket_index(ord.symbol_id) {
+            self.brackets[i].symbol_id = ord.symbol_id;
+            self.brackets[i].arm(ord.direction, filled_qty, ord.stop_loss_price, ord.take_profit_price);
+        }
+    }
+
+    /// Executes a risk-approved StrategyIntent (identical pipeline for Paper & Live)
+    pub fn execute_intent(
+        &mut self,
+        intent: &StrategyIntent,
+        verdict: &RiskVerdict,
+        bid: f64,
+        ask: f64,
+        is_reduce_only: bool,
+        now_ms: u64,
+    ) -> ExecutionOutput {
+        let mut out = ExecutionOutput::empty();
+        let sym = intent.symbol_id;
+
+        // 1. Honor Cancel-All requests (Toxic-Flow Shield / Safe-Mode / Risk Breakers)
+        if verdict.require_cancel_all || intent.cancel_open_orders {
+            let cancelled = self.osm.cancel_all_for_symbol(sym, now_ms);
+            out.cancelled_count = cancelled;
+            if self.mode == ExecutionMode::Live && (cancelled > 0 || verdict.require_cancel_all) {
+                out.push_cmd(LiveDispatchCommand {
+                    kind: LiveCommandKind::CancelAllSymbol,
+                    client_order_id: 0,
+                    symbol_id: sym,
+                    direction: TradeDirection::Flat,
+                    price: 0.0,
+                    qty: 0.0,
+                    stop_loss_price: 0.0,
+                    reduce_only: false,
+                    created_ms: now_ms,
+                });
+            }
+        }
+
+        if !verdict.approved || verdict.approved_qty <= 1e-12 {
+            return out;
+        }
+
+        // 2. Register deterministic Submitting order in OrderStateMachine
+        let cid = match self.osm.create_submitting(
+            sym,
+            intent.direction,
+            intent.style,
+            intent.limit_price,
+            verdict.approved_qty,
+            intent.stop_loss_price,
+            intent.take_profit_price,
+            is_reduce_only,
+            now_ms,
+        ) {
+            Some(id) => id,
+            None => return out,
+        };
+        out.submitted_order_id = Some(cid);
+
+        // 3. Sink split: Paper Simulator vs Live Exchange Command Queue
+        match self.mode {
+            ExecutionMode::Paper => {
+                let mut armed_snap: Option<(ExecOrder, f64)> = None;
+                if let Some(ord) = self.osm.get_mut(cid) {
+                    if let Some(fill) = self.paper.submit_order(ord, bid, ask, now_ms) {
+                        out.push_fill(fill);
+                        armed_snap = Some((*ord, fill.fill_qty));
+                    }
+                }
+                if let Some((ord_snap, fqty)) = armed_snap {
+                    self.arm_bracket_from_order(&ord_snap, fqty);
+                }
+            }
+            ExecutionMode::Live => {
+                let kind = match intent.style {
+                    ExecutionStyle::MakerPostOnly => LiveCommandKind::PlaceLimitPostOnly,
+                    ExecutionStyle::TakerAggressive | ExecutionStyle::EmergencyClose => {
+                        LiveCommandKind::PlaceMarketIoc
+                    }
+                    ExecutionStyle::None => return out,
+                };
+                out.push_cmd(LiveDispatchCommand {
+                    kind,
+                    client_order_id: cid,
+                    symbol_id: sym,
+                    direction: intent.direction,
+                    price: intent.limit_price,
+                    qty: verdict.approved_qty,
+                    stop_loss_price: intent.stop_loss_price,
+                    reduce_only: is_reduce_only,
+                    created_ms: now_ms,
+                });
+
+                // Attach mandatory exchange-side Hard Stop-Loss on risk-increasing entries
+                if !is_reduce_only && intent.stop_loss_price.is_finite() && intent.stop_loss_price > 0.0 {
+                    let sl_dir = match intent.direction {
+                        TradeDirection::Long => TradeDirection::Short,
+                        TradeDirection::Short => TradeDirection::Long,
+                        TradeDirection::Flat => TradeDirection::Flat,
+                    };
+                    out.push_cmd(LiveDispatchCommand {
+                        kind: LiveCommandKind::PlaceHardStop,
+                        client_order_id: cid,
+                        symbol_id: sym,
+                        direction: sl_dir,
+                        price: intent.stop_loss_price,
+                        qty: verdict.approved_qty,
+                        stop_loss_price: intent.stop_loss_price,
+                        reduce_only: true,
+                        created_ms: now_ms,
+                    });
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Evaluates resting Paper orders and active Hard SL/TP brackets on each top-of-book quote
+    pub fn on_market_tick(
+        &mut self,
+        symbol_id: SymbolId,
+        bid: f64,
+        ask: f64,
+        now_ms: u64,
+    ) -> ExecutionOutput {
+        let mut out = ExecutionOutput::empty();
+        if self.mode != ExecutionMode::Paper || !bid.is_finite() || !ask.is_finite() || bid <= 0.0 || ask <= bid {
+            return out;
+        }
+
+        // 1. Check active Hard SL / TP bracket first
+        if let Some(idx) = Self::bracket_index(symbol_id) {
+            let br = self.brackets[idx];
+            if let Some((is_sl, is_tp, exit_px)) = br.check_trigger(bid, ask) {
+                let close_dir = match br.position_dir {
+                    TradeDirection::Long => TradeDirection::Short,
+                    TradeDirection::Short => TradeDirection::Long,
+                    TradeDirection::Flat => TradeDirection::Flat,
+                };
+                if close_dir != TradeDirection::Flat && br.qty > 1e-12 {
+                    let slip_bps = if is_sl {
+                        self.paper.cfg.emergency_slippage_bps.max(0.0)
+                    } else {
+                        self.paper.cfg.taker_slippage_bps.max(0.0)
+                    };
+                    let fill_px = match close_dir {
+                        TradeDirection::Long => exit_px * (1.0 + (slip_bps / 10_000.0)),
+                        TradeDirection::Short => exit_px * (1.0 - (slip_bps / 10_000.0)),
+                        TradeDirection::Flat => exit_px,
+                    };
+                    let fee_usd = (br.qty * fill_px) * (self.paper.cfg.taker_fee_bps.max(0.0) / 10_000.0);
+                    out.push_fill(FillEvent {
+                        client_order_id: 0,
+                        symbol_id,
+                        direction: close_dir,
+                        fill_qty: br.qty,
+                        fill_price: fill_px,
+                        fee_usd,
+                        is_maker: false,
+                        is_hard_sl: is_sl,
+                        is_take_profit: is_tp,
+                        timestamp_ms: now_ms,
+                    });
+                    self.brackets[idx].disarm();
+                }
+            }
+        }
+
+        // 2. Check resting Post-Only limit orders for maker fills
+        let mut buf: [Option<FillEvent>; MAX_TRACKED_ORDERS] = [None; MAX_TRACKED_ORDERS];
+        let n = self.paper.on_market_quotes(&mut self.osm, symbol_id, bid, ask, now_ms, &mut buf);
+        for i in 0..n {
+            if let Some(fill) = buf[i] {
+                out.push_fill(fill);
+                if let Some(ord_snap) = self.osm.get(fill.client_order_id).copied() {
+                    self.arm_bracket_from_order(&ord_snap, fill.fill_qty);
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Live exchange callback: order accepted and resting on book
+    pub fn on_exchange_ack(&mut self, client_order_id: u64, exchange_order_id: u64, now_ms: u64) -> bool {
+        if let Some(ord) = self.osm.get_mut(client_order_id) {
+            ord.exchange_order_id = exchange_order_id;
+            return ord.transition(ExecOrderState::Open, now_ms);
+        }
+        false
+    }
+
+    /// Live exchange callback: incremental or full fill received from private WS/REST
+    pub fn on_exchange_fill(
+        &mut self,
+        client_order_id: u64,
+        fill_qty: f64,
+        fill_price: f64,
+        fee_usd: f64,
+        is_maker: bool,
+        now_ms: u64,
+    ) -> Option<FillEvent> {
+        let mut snap: Option<(ExecOrder, FillEvent)> = None;
+        if let Some(ord) = self.osm.get_mut(client_order_id) {
+            if ord.apply_fill(fill_qty, fill_price, fee_usd, now_ms) {
+                let ev = FillEvent {
+                    client_order_id: ord.client_order_id,
+                    symbol_id: ord.symbol_id,
+                    direction: ord.direction,
+                    fill_qty,
+                    fill_price,
+                    fee_usd: fee_usd.max(0.0),
+                    is_maker,
+                    is_hard_sl: false,
+                    is_take_profit: false,
+                    timestamp_ms: now_ms,
+                };
+                snap = Some((*ord, ev));
+            }
+        }
+        if let Some((ord_snap, ev)) = snap {
+            self.arm_bracket_from_order(&ord_snap, ev.fill_qty);
+            return Some(ev);
+        }
+        None
+    }
+
+    /// Live exchange callback: order cancelled or rejected
+    pub fn on_exchange_cancel_or_reject(&mut self, client_order_id: u64, failed: bool, now_ms: u64) -> bool {
+        if let Some(ord) = self.osm.get_mut(client_order_id) {
+            let next = if failed {
+                ExecOrderState::Failed
+            } else {
+                ExecOrderState::Cancelled
+            };
+            return ord.transition(next, now_ms);
+        }
+        false
+    }
+
+    /// Global emergency Cancel-All across BTC, ETH, SOL (Dead-Man's Switch / Kill-Switch)
+    pub fn cancel_all_global(&mut self, now_ms: u64) -> ExecutionOutput {
+        let mut out = ExecutionOutput::empty();
+        out.cancelled_count = self.osm.cancel_all(now_ms);
+        if self.mode == ExecutionMode::Live {
+            out.push_cmd(LiveDispatchCommand {
+                kind: LiveCommandKind::CancelAllGlobal,
+                client_order_id: 0,
+                symbol_id: SymbolId(0),
+                direction: TradeDirection::Flat,
+                price: 0.0,
+                qty: 0.0,
+                stop_loss_price: 0.0,
+                reduce_only: false,
+                created_ms: now_ms,
+            });
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod execution_tests {
+    use super::*;
+    use crate::sniper_strategy::BlockReason;
+
+    fn sample_long_intent(limit_px: f64, sl_px: f64, style: ExecutionStyle) -> StrategyIntent {
+        StrategyIntent {
+            symbol_id: SymbolId(0),
+            direction: TradeDirection::Long,
+            style,
+            block_reason: BlockReason::None,
+            limit_price: limit_px,
+            stop_loss_price: sl_px,
+            take_profit_price: limit_px + 200.0,
+            size_fraction: 0.25,
+            expected_edge_bps: 15.0,
+            fee_hurdle_bps: 6.5,
+            toxic_score: 0.1,
+            cancel_open_orders: false,
+        }
+    }
+
+    #[test]
+    fn test_order_state_machine_rejects_illegal_transitions() {
+        let mut ord = ExecOrder::empty();
+        assert!(!ord.transition(ExecOrderState::Filled, 100)); // Idle -> Filled illegal
+        assert!(ord.transition(ExecOrderState::Submitting, 100));
+        assert!(ord.transition(ExecOrderState::Open, 110));
+        assert!(ord.transition(ExecOrderState::Cancelled, 120));
+        assert!(!ord.transition(ExecOrderState::Filled, 130)); // Terminal -> Filled illegal
+    }
+
+    #[test]
+    fn test_paper_post_only_fill_and_hard_sl_trigger() {
+        let mut exec = ExecutionEngine::new(ExecutionMode::Paper, PaperSimConfig::default_crypto());
+        let intent = sample_long_intent(90_000.0, 89_500.0, ExecutionStyle::MakerPostOnly);
+        let verdict = RiskVerdict::approved(SymbolId(0), 900.0, 0.01, false);
+
+        // Resting passive bid below ask -> Open, no immediate fill
+        let res = exec.execute_intent(&intent, &verdict, 90_000.0, 90_010.0, false, 1_000);
+        assert_eq!(res.fill_count, 0);
+        let cid = res.submitted_order_id.unwrap_or(0);
+        assert_eq!(exec.osm.get(cid).map(|o| o.state), Some(ExecOrderState::Open));
+
+        // Price drops to touch 90_000 ask -> Maker fill + Hard SL bracket armed
+        let tick_fill = exec.on_market_tick(SymbolId(0), 89_995.0, 90_000.0, 2_000);
+        assert_eq!(tick_fill.fill_count, 1);
+        assert_eq!(tick_fill.fills[0].map(|f| f.is_maker), Some(true));
+        assert_eq!(exec.bracket_for(SymbolId(0)).map(|b| b.active), Some(true));
+
+        // Price breaches 89_500 SL -> Hard SL triggers and disarms bracket
+        let sl_tick = exec.on_market_tick(SymbolId(0), 89_490.0, 89_500.0, 3_000);
+        assert_eq!(sl_tick.fill_count, 1);
+        assert_eq!(sl_tick.fills[0].map(|f| f.is_hard_sl), Some(true));
+        assert_eq!(exec.bracket_for(SymbolId(0)).map(|b| b.active), Some(false));
+    }
+
+    #[test]
+    fn test_live_mode_dispatches_post_only_and_hard_sl_commands() {
+        let mut exec = ExecutionEngine::new(ExecutionMode::Live, PaperSimConfig::default_crypto());
+        let intent = sample_long_intent(3_000.0, 2_970.0, ExecutionStyle::MakerPostOnly);
+        let verdict = RiskVerdict::approved(SymbolId(1), 300.0, 0.1, false);
+
+        let out = exec.execute_intent(&intent, &verdict, 3_000.0, 3_001.0, false, 5_000);
+        assert_eq!(out.cmd_count, 2);
+        assert_eq!(out.live_cmds[0].map(|c| c.kind), Some(LiveCommandKind::PlaceLimitPostOnly));
+        assert_eq!(out.live_cmds[1].map(|c| c.kind), Some(LiveCommandKind::PlaceHardStop));
+
+        let cid = out.submitted_order_id.unwrap_or(0);
+        assert!(exec.on_exchange_ack(cid, 99_001, 5_050));
+        let fill = exec.on_exchange_fill(cid, 0.1, 3_000.0, 0.06, true, 5_200);
+        assert!(fill.is_some());
+        assert_eq!(exec.osm.get(cid).map(|o| o.state), Some(ExecOrderState::Filled));
+    }
+}
