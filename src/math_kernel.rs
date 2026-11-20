@@ -339,3 +339,84 @@ impl OrderFlowImbalance {
         (self.ewma_ofi / self.ewma_abs_ofi).clamp(-1.0, 1.0)
     }
 }
+use crate::types::{EngineSignal, SymbolId, Timeframe};
+
+pub const NUM_ALPHA_ENGINES: usize = 86;
+
+const ZERO_SIGNAL: EngineSignal = EngineSignal {
+    engine_id: 0,
+    timeframe: Timeframe::Sec1,
+    score: 0.0,
+    confidence: 0.0,
+};
+
+#[inline]
+pub(crate) fn tanh_s(val: f64, scale: f64) -> f64 {
+    if !val.is_finite() || !scale.is_finite() || scale <= 1e-12 {
+        return 0.0;
+    }
+    (val / scale).tanh().clamp(-1.0, 1.0)
+}
+
+/// Zero-allocation output of all 86 silent alpha engines + consensus diagnostics
+#[derive(Debug, Clone, Copy)]
+pub struct AlphaBatch {
+    pub symbol_id: SymbolId,
+    pub signals: [EngineSignal; NUM_ALPHA_ENGINES],
+    pub active_count: usize,
+    pub consensus_score: f64,      // [-1.0, 1.0]
+    pub consensus_confidence: f64, // [0.0, 1.0]
+    pub dispersion: f64,           // [0.0, 1.0]
+    pub timestamp_ms: u64,
+}
+
+impl AlphaBatch {
+    pub const fn empty(symbol_id: SymbolId, timestamp_ms: u64) -> Self {
+        Self {
+            symbol_id,
+            signals: [ZERO_SIGNAL; NUM_ALPHA_ENGINES],
+            active_count: 0,
+            consensus_score: 0.0,
+            consensus_confidence: 0.0,
+            dispersion: 0.0,
+            timestamp_ms,
+        }
+    }
+
+    /// Confidence-weighted consensus and inter-engine dispersion across all 86 engines
+    pub fn finalize(&mut self) {
+        let mut weighted_sum = 0.0;
+        let mut conf_sum = 0.0;
+        let mut active = 0usize;
+
+        for sig in self.signals.iter() {
+            if sig.confidence > 1e-6 && sig.score.is_finite() && sig.confidence.is_finite() {
+                weighted_sum += sig.weighted_score();
+                conf_sum += sig.confidence;
+                active += 1;
+            }
+        }
+
+        self.active_count = active;
+        if active == 0 || conf_sum <= 1e-12 {
+            self.consensus_score = 0.0;
+            self.consensus_confidence = 0.0;
+            self.dispersion = 0.0;
+            return;
+        }
+
+        let mean_score = (weighted_sum / conf_sum).clamp(-1.0, 1.0);
+        let mut var_acc = 0.0;
+        for sig in self.signals.iter() {
+            if sig.confidence > 1e-6 && sig.score.is_finite() {
+                let d = sig.score - mean_score;
+                var_acc += sig.confidence * (d * d);
+            }
+        }
+
+        let std_dev = (var_acc / conf_sum).max(0.0).sqrt();
+        self.consensus_score = mean_score;
+        self.consensus_confidence = (conf_sum / (active as f64)).clamp(0.0, 1.0);
+        self.dispersion = std_dev.clamp(0.0, 1.0);
+    }
+}
