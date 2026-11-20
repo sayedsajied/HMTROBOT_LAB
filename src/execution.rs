@@ -284,3 +284,275 @@ impl OrderStateMachine {
         &self.slots
     }
 }
+/// Realistic local fee & slippage parameters for 100% Paper-to-Live parity
+#[derive(Debug, Clone, Copy)]
+pub struct PaperSimConfig {
+    pub maker_fee_bps: f64,
+    pub taker_fee_bps: f64,
+    pub taker_slippage_bps: f64,
+    pub emergency_slippage_bps: f64,
+}
+
+impl PaperSimConfig {
+    pub const fn default_crypto() -> Self {
+        Self {
+            maker_fee_bps: 2.0,
+            taker_fee_bps: 5.0,
+            taker_slippage_bps: 1.5,
+            emergency_slippage_bps: 4.0,
+        }
+    }
+}
+
+/// Deterministic Paper Execution Engine (same FillEvent & state transitions as Live)
+#[derive(Debug, Clone, Copy)]
+pub struct PaperSimulator {
+    pub cfg: PaperSimConfig,
+    next_sim_exchange_id: u64,
+}
+
+impl PaperSimulator {
+    pub const fn new(cfg: PaperSimConfig) -> Self {
+        Self {
+            cfg,
+            next_sim_exchange_id: 100_000,
+        }
+    }
+
+    #[inline]
+    fn alloc_exchange_id(&mut self) -> u64 {
+        let id = self.next_sim_exchange_id;
+        self.next_sim_exchange_id = self.next_sim_exchange_id.saturating_add(1);
+        id
+    }
+
+    /// Processes a newly created Submitting order against current top-of-book (bid, ask)
+    pub fn submit_order(
+        &mut self,
+        order: &mut ExecOrder,
+        bid: f64,
+        ask: f64,
+        now_ms: u64,
+    ) -> Option<FillEvent> {
+        if order.state != ExecOrderState::Submitting
+            || !bid.is_finite()
+            || !ask.is_finite()
+            || bid <= 0.0
+            || ask <= bid
+        {
+            order.transition(ExecOrderState::Failed, now_ms);
+            return None;
+        }
+
+        order.exchange_order_id = self.alloc_exchange_id();
+
+        match order.style {
+            ExecutionStyle::MakerPostOnly => {
+                // Post-Only rule: reject/cancel immediately if limit would cross the spread
+                let would_cross = match order.direction {
+                    TradeDirection::Long => order.limit_price >= ask,
+                    TradeDirection::Short => order.limit_price <= bid,
+                    TradeDirection::Flat => true,
+                };
+                if would_cross {
+                    order.transition(ExecOrderState::Cancelled, now_ms);
+                    return None;
+                }
+                order.transition(ExecOrderState::Open, now_ms);
+                None
+            }
+            ExecutionStyle::TakerAggressive | ExecutionStyle::EmergencyClose => {
+                let slip_bps = if order.style == ExecutionStyle::EmergencyClose {
+                    self.cfg.emergency_slippage_bps.max(0.0)
+                } else {
+                    self.cfg.taker_slippage_bps.max(0.0)
+                };
+                let fill_px = match order.direction {
+                    TradeDirection::Long => ask * (1.0 + (slip_bps / 10_000.0)),
+                    TradeDirection::Short => bid * (1.0 - (slip_bps / 10_000.0)),
+                    TradeDirection::Flat => {
+                        order.transition(ExecOrderState::Failed, now_ms);
+                        return None;
+                    }
+                };
+                let fill_qty = order.remaining_qty();
+                let fee_usd = (fill_qty * fill_px) * (self.cfg.taker_fee_bps.max(0.0) / 10_000.0);
+                if order.apply_fill(fill_qty, fill_px, fee_usd, now_ms) {
+                    Some(FillEvent {
+                        client_order_id: order.client_order_id,
+                        symbol_id: order.symbol_id,
+                        direction: order.direction,
+                        fill_qty,
+                        fill_price: fill_px,
+                        fee_usd,
+                        is_maker: false,
+                        is_hard_sl: order.style == ExecutionStyle::EmergencyClose,
+                        is_take_profit: false,
+                        timestamp_ms: now_ms,
+                    })
+                } else {
+                    None
+                }
+            }
+            ExecutionStyle::None => {
+                order.transition(ExecOrderState::Failed, now_ms);
+                None
+            }
+        }
+    }
+
+    /// Evaluates resting Post-Only orders against new (bid, ask); returns number of fills written
+    pub fn on_market_quotes(
+        &self,
+        osm: &mut OrderStateMachine,
+        symbol_id: SymbolId,
+        bid: f64,
+        ask: f64,
+        now_ms: u64,
+        out_fills: &mut [Option<FillEvent>; MAX_TRACKED_ORDERS],
+    ) -> usize {
+        if !bid.is_finite() || !ask.is_finite() || bid <= 0.0 || ask <= bid {
+            return 0;
+        }
+        let mut fill_count = 0usize;
+
+        for ord in osm.slots.iter_mut() {
+            if ord.symbol_id != symbol_id
+                || !matches!(ord.state, ExecOrderState::Open | ExecOrderState::PartiallyFilled)
+            {
+                continue;
+            }
+            let touched = match ord.direction {
+                TradeDirection::Long => ask <= ord.limit_price,
+                TradeDirection::Short => bid >= ord.limit_price,
+                TradeDirection::Flat => false,
+            };
+            if !touched {
+                continue;
+            }
+
+            let fill_qty = ord.remaining_qty();
+            let fill_px = ord.limit_price;
+            let fee_usd = (fill_qty * fill_px) * (self.cfg.maker_fee_bps.max(0.0) / 10_000.0);
+            if ord.apply_fill(fill_qty, fill_px, fee_usd, now_ms) && fill_count < MAX_TRACKED_ORDERS {
+                out_fills[fill_count] = Some(FillEvent {
+                    client_order_id: ord.client_order_id,
+                    symbol_id: ord.symbol_id,
+                    direction: ord.direction,
+                    fill_qty,
+                    fill_price: fill_px,
+                    fee_usd,
+                    is_maker: true,
+                    is_hard_sl: false,
+                    is_take_profit: false,
+                    timestamp_ms: now_ms,
+                });
+                fill_count += 1;
+            }
+        }
+        fill_count
+    }
+}
+
+/// Per-symbol Exchange-Side Hard Stop-Loss & Take-Profit Bracket
+#[derive(Debug, Clone, Copy)]
+pub struct StopBracket {
+    pub symbol_id: SymbolId,
+    pub position_dir: TradeDirection,
+    pub qty: f64,
+    pub sl_price: f64,
+    pub tp_price: f64,
+    pub active: bool,
+}
+
+impl StopBracket {
+    pub const fn inactive(symbol_id: SymbolId) -> Self {
+        Self {
+            symbol_id,
+            position_dir: TradeDirection::Flat,
+            qty: 0.0,
+            sl_price: 0.0,
+            tp_price: 0.0,
+            active: false,
+        }
+    }
+
+    pub fn arm(&mut self, dir: TradeDirection, qty: f64, sl_price: f64, tp_price: f64) {
+        if dir == TradeDirection::Flat
+            || !qty.is_finite()
+            || qty <= 0.0
+            || !sl_price.is_finite()
+            || sl_price <= 0.0
+        {
+            self.disarm();
+            return;
+        }
+        self.position_dir = dir;
+        self.qty = qty;
+        self.sl_price = sl_price;
+        self.tp_price = if tp_price.is_finite() && tp_price > 0.0 { tp_price } else { 0.0 };
+        self.active = true;
+    }
+
+    #[inline]
+    pub fn disarm(&mut self) {
+        self.position_dir = TradeDirection::Flat;
+        self.qty = 0.0;
+        self.sl_price = 0.0;
+        self.tp_price = 0.0;
+        self.active = false;
+    }
+
+    /// Checks whether (bid, ask) breaches Hard SL or TP; returns Some((is_sl, is_tp, exit_price))
+    #[inline]
+    pub fn check_trigger(&self, bid: f64, ask: f64) -> Option<(bool, bool, f64)> {
+        if !self.active || !bid.is_finite() || !ask.is_finite() || bid <= 0.0 || ask <= 0.0 {
+            return None;
+        }
+        match self.position_dir {
+            TradeDirection::Long => {
+                if bid <= self.sl_price {
+                    Some((true, false, bid))
+                } else if self.tp_price > 0.0 && bid >= self.tp_price {
+                    Some((false, true, bid))
+                } else {
+                    None
+                }
+            }
+            TradeDirection::Short => {
+                if ask >= self.sl_price {
+                    Some((true, false, ask))
+                } else if self.tp_price > 0.0 && ask <= self.tp_price {
+                    Some((false, true, ask))
+                } else {
+                    None
+                }
+            }
+            TradeDirection::Flat => None,
+        }
+    }
+}
+
+/// Non-blocking wire command emitted when ExecutionMode::Live is active
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveCommandKind {
+    PlaceLimitPostOnly,
+    PlaceMarketIoc,
+    PlaceHardStop,
+    CancelOrder,
+    CancelAllSymbol,
+    CancelAllGlobal,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LiveDispatchCommand {
+    pub kind: LiveCommandKind,
+    pub client_order_id: u64,
+    pub symbol_id: SymbolId,
+    pub direction: TradeDirection,
+    pub price: f64,
+    pub qty: f64,
+    pub stop_loss_price: f64,
+    pub reduce_only: bool,
+    pub created_ms: u64,
+}
