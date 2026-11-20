@@ -19,4 +19,5 @@ mod sniper_strategy;
 mod risk;
 mod execution;
 mod vault;
+mod telegram_hud;
 
