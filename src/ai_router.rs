@@ -311,3 +311,174 @@ impl ContextualBandit86 {
         (best_i + 1) as u16
     }
 }
+/// Layer 3: Online Actor-Critic RL Controller (Fractional Kelly, SL Width, TP Skew)
+#[derive(Debug, Clone, Copy)]
+pub struct ActorCriticController {
+    pub value_est: [f64; NUM_REGIMES],      // Critic baseline expected reward (bps)
+    pub kelly_param: [f64; NUM_REGIMES],    // Actor: Fractional Kelly [0.02, 0.50]
+    pub sl_param: [f64; NUM_REGIMES],       // Actor: SL vol multiplier [0.80, 3.00]
+    pub tp_param: [f64; NUM_REGIMES],       // Actor: TP skew multiplier [0.50, 2.50]
+    pub lr_critic: f64,
+    pub lr_actor: f64,
+}
+
+impl ActorCriticController {
+    pub const fn new() -> Self {
+        Self {
+            value_est: [0.0; NUM_REGIMES],
+            kelly_param: [0.15, 0.25, 0.12, 0.04],
+            sl_param: [1.20, 1.80, 2.20, 1.00],
+            tp_param: [1.10, 2.00, 1.60, 0.80],
+            lr_critic: 0.10,
+            lr_actor: 0.04,
+        }
+    }
+
+    /// Returns RL-tuned (kelly_fraction, sl_mult, tp_skew) scaled by Watchdog drawdown factor
+    #[inline]
+    pub fn policy(&self, regime: AiRegime, size_scale: f64) -> (f64, f64, f64) {
+        let r = regime.index();
+        let scale = if size_scale.is_finite() { size_scale.clamp(0.0, 1.0) } else { 0.0 };
+        let kelly = (self.kelly_param[r] * scale).clamp(0.0, 0.50);
+        let sl = self.sl_param[r].clamp(0.80, 3.00);
+        let tp = self.tp_param[r].clamp(0.50, 2.50);
+        (kelly, sl, tp)
+    }
+
+    /// Online Actor-Critic update from realized post-fee trade outcome (bps)
+    pub fn update_from_trade(
+        &mut self,
+        regime: AiRegime,
+        post_fee_pnl_bps: f64,
+        hit_sl: bool,
+        hit_tp: bool,
+    ) {
+        if !post_fee_pnl_bps.is_finite() {
+            return;
+        }
+        let r = regime.index();
+        let reward = (post_fee_pnl_bps / 10.0).clamp(-2.0, 2.0);
+        let td_error = reward - self.value_est[r];
+
+        // Critic update
+        self.value_est[r] = (self.value_est[r] + (self.lr_critic * td_error)).clamp(-2.0, 2.0);
+
+        // Actor update: Kelly sizing rises on positive TD-error, contracts on negative
+        let next_kelly = self.kelly_param[r] + (self.lr_actor * 0.25 * td_error);
+        self.kelly_param[r] = next_kelly.clamp(0.02, 0.50);
+
+        // Actor update: SL widens slightly if whipsawed by SL on negative TD, tightens on clean wins
+        let sl_grad = if hit_sl && td_error < 0.0 {
+            0.08
+        } else if hit_tp && td_error > 0.0 {
+            -0.03
+        } else {
+            -0.02 * td_error
+        };
+        self.sl_param[r] = (self.sl_param[r] + (self.lr_actor * sl_grad * 4.0)).clamp(0.80, 3.00);
+
+        // Actor update: TP skew expands on positive momentum wins, contracts on reversals
+        let tp_grad = if hit_tp && td_error > 0.0 {
+            0.10
+        } else if td_error < 0.0 {
+            -0.08
+        } else {
+            0.03 * td_error
+        };
+        self.tp_param[r] = (self.tp_param[r] + (self.lr_actor * tp_grad * 4.0)).clamp(0.50, 2.50);
+    }
+}
+
+/// Self-Healing Fault Isolator, Drawdown Halver & Stale-Feed / Daily-Loss Safe-Mode Watchdog
+#[derive(Debug, Clone, Copy)]
+pub struct SelfHealingWatchdog {
+    pub isolated: [bool; NUM_ALPHA_ENGINES],
+    pub fault_counts: [u16; NUM_ALPHA_ENGINES],
+    pub loss_streak: u32,
+    pub size_scale: f64,
+    pub stale_limit_ms: u64,
+    pub max_daily_loss_pct: f64,
+    pub daily_loss_breached: bool,
+    pub feed_stale: bool,
+    pub safe_mode: bool,
+}
+
+impl SelfHealingWatchdog {
+    pub const fn new(stale_limit_ms: u64, max_daily_loss_pct: f64) -> Self {
+        Self {
+            isolated: [false; NUM_ALPHA_ENGINES],
+            fault_counts: [0; NUM_ALPHA_ENGINES],
+            loss_streak: 0,
+            size_scale: 1.0,
+            stale_limit_ms,
+            max_daily_loss_pct,
+            daily_loss_breached: false,
+            feed_stale: false,
+            safe_mode: false,
+        }
+    }
+
+    /// Inspect every engine output for NaN/Inf/out-of-bounds and isolate repeat offenders
+    pub fn inspect_batch(&mut self, batch: &AlphaBatch) {
+        for i in 0..NUM_ALPHA_ENGINES {
+            let sig = batch.signals[i];
+            let faulty = !sig.score.is_finite()
+                || !sig.confidence.is_finite()
+                || sig.score < -1.0001
+                || sig.score > 1.0001
+                || sig.confidence < -0.0001
+                || sig.confidence > 1.0001;
+
+            if faulty {
+                self.fault_counts[i] = self.fault_counts[i].saturating_add(1);
+                if self.fault_counts[i] >= 3 {
+                    self.isolated[i] = true;
+                }
+            }
+        }
+    }
+
+    /// Halve position size on consecutive loss streaks and lock Safe-Mode on daily loss breach
+    pub fn record_trade_outcome(&mut self, post_fee_pnl_bps: f64, daily_pnl_pct: f64) {
+        if post_fee_pnl_bps.is_finite() {
+            if post_fee_pnl_bps < 0.0 {
+                self.loss_streak = self.loss_streak.saturating_add(1);
+                let exp = self.loss_streak.min(4) as i32;
+                self.size_scale = (0.5_f64).powi(exp).clamp(0.125, 1.0);
+            } else if post_fee_pnl_bps > 0.0 {
+                self.loss_streak = 0;
+                self.size_scale = (self.size_scale * 1.5).clamp(0.25, 1.0);
+            }
+        }
+
+        if daily_pnl_pct.is_finite() && daily_pnl_pct <= -self.max_daily_loss_pct.abs() {
+            self.daily_loss_breached = true;
+        }
+        self.recompute_safe_mode();
+    }
+
+    /// Check >3s stale market data feed and update Safe-Mode flag
+    pub fn check_feed_health(&mut self, now_ms: u64, last_feed_ms: u64) -> bool {
+        let age = now_ms.saturating_sub(last_feed_ms);
+        self.feed_stale = last_feed_ms == 0 || age > self.stale_limit_ms;
+        self.recompute_safe_mode();
+        self.safe_mode
+    }
+
+    #[inline]
+    pub fn isolated_count(&self) -> usize {
+        let mut count = 0usize;
+        for &flag in self.isolated.iter() {
+            if flag {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[inline]
+    fn recompute_safe_mode(&mut self) {
+        let too_many_faults = self.isolated_count() >= (NUM_ALPHA_ENGINES / 2);
+        self.safe_mode = self.feed_stale || self.daily_loss_breached || too_many_faults;
+    }
+}
