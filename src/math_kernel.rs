@@ -420,3 +420,139 @@ impl AlphaBatch {
         self.dispersion = std_dev.clamp(0.0, 1.0);
     }
 }
+/// Stack-allocated rolling state for a single timeframe (1s, 15s, 1m, or 5m)
+#[derive(Debug, Clone, Copy)]
+pub struct TimeframeState {
+    pub closes: RollingWindow<32>,
+    pub ranges_bps: RollingWindow<32>,
+    pub vol_deltas: RollingWindow<32>,
+    pub ema_fast: f64,
+    pub ema_slow: f64,
+    pub last_bar: Option<OhlcvBar>,
+    pub bar_count: u64,
+}
+
+impl TimeframeState {
+    pub const fn new() -> Self {
+        Self {
+            closes: RollingWindow::new(),
+            ranges_bps: RollingWindow::new(),
+            vol_deltas: RollingWindow::new(),
+            ema_fast: 0.0,
+            ema_slow: 0.0,
+            last_bar: None,
+            bar_count: 0,
+        }
+    }
+
+    pub fn on_bar(&mut self, bar: OhlcvBar) {
+        if !bar.close.is_finite() || bar.close <= 0.0 {
+            return;
+        }
+        self.closes.push(bar.close);
+        self.ranges_bps.push(bar.range_bps());
+        self.vol_deltas.push(bar.volume_delta_ratio());
+
+        if self.bar_count == 0 {
+            self.ema_fast = bar.close;
+            self.ema_slow = bar.close;
+        } else {
+            self.ema_fast = (0.35 * bar.close) + (0.65 * self.ema_fast);
+            self.ema_slow = (0.12 * bar.close) + (0.88 * self.ema_slow);
+        }
+
+        self.last_bar = Some(bar);
+        self.bar_count = self.bar_count.saturating_add(1);
+    }
+
+    #[inline]
+    pub fn ema_spread_bps(&self) -> f64 {
+        if self.bar_count < 2 || self.ema_slow <= 0.0 {
+            return 0.0;
+        }
+        let s = ((self.ema_fast - self.ema_slow) / self.ema_slow) * 10_000.0;
+        if s.is_finite() { s } else { 0.0 }
+    }
+}
+
+/// Pre-parsed zero-allocation tick input shared across all 86 engines (BTC / ETH / SOL)
+#[derive(Debug, Clone, Copy)]
+pub struct EngineTickInput {
+    pub price: f64,
+    pub bid: f64,
+    pub ask: f64,
+    pub bid_sz: f64,
+    pub ask_sz: f64,
+    pub top3_bid_vol: f64,
+    pub top3_ask_vol: f64,
+    pub top5_bid_vol: f64,
+    pub top5_ask_vol: f64,
+    pub b2_sz: f64,
+    pub a2_sz: f64,
+    pub spot_price: f64,
+    pub funding_rate: f64,
+    pub btc_anchor_ret_bps: f64,
+    pub dt_sec: f64,
+    pub has_book: bool,
+}
+
+impl EngineTickInput {
+    pub fn from_snapshot(
+        book: &L2OrderBook,
+        fb: &FundingBasisSnapshot,
+        btc_anchor_ret_bps: f64,
+        dt_sec: f64,
+    ) -> Self {
+        let has_book = book.is_valid();
+        let (bid, bid_sz) = book
+            .best_bid()
+            .map(|l| (l.price, l.qty))
+            .unwrap_or((fb.mark_price, 1.0));
+        let (ask, ask_sz) = book
+            .best_ask()
+            .map(|l| (l.price, l.qty))
+            .unwrap_or((fb.mark_price, 1.0));
+
+        let price = if fb.mark_price.is_finite() && fb.mark_price > 0.0 {
+            fb.mark_price
+        } else if has_book {
+            (bid + ask) * 0.5
+        } else {
+            0.0
+        };
+
+        let (mut top3_b, mut top3_a, mut top5_b, mut top5_a) = (0.0, 0.0, 0.0, 0.0);
+        for i in 0..5 {
+            if i < book.bid_count && book.bids[i].is_valid() {
+                top5_b += book.bids[i].qty;
+                if i < 3 { top3_b += book.bids[i].qty; }
+            }
+            if i < book.ask_count && book.asks[i].is_valid() {
+                top5_a += book.asks[i].qty;
+                if i < 3 { top3_a += book.asks[i].qty; }
+            }
+        }
+
+        let b2_sz = if book.bid_count >= 2 && book.bids[1].is_valid() { book.bids[1].qty } else { bid_sz };
+        let a2_sz = if book.ask_count >= 2 && book.asks[1].is_valid() { book.asks[1].qty } else { ask_sz };
+
+        Self {
+            price,
+            bid,
+            ask,
+            bid_sz: bid_sz.max(0.0),
+            ask_sz: ask_sz.max(0.0),
+            top3_bid_vol: top3_b.max(bid_sz),
+            top3_ask_vol: top3_a.max(ask_sz),
+            top5_bid_vol: top5_b.max(bid_sz),
+            top5_ask_vol: top5_a.max(ask_sz),
+            b2_sz: b2_sz.max(0.0),
+            a2_sz: a2_sz.max(0.0),
+            spot_price: if fb.index_price.is_finite() && fb.index_price > 0.0 { fb.index_price } else { price },
+            funding_rate: if fb.funding_rate.is_finite() { fb.funding_rate } else { 0.0 },
+            btc_anchor_ret_bps: if btc_anchor_ret_bps.is_finite() { btc_anchor_ret_bps } else { 0.0 },
+            dt_sec: dt_sec.clamp(0.001, 60.0),
+            has_book,
+        }
+    }
+}
