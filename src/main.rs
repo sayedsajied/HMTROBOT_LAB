@@ -14,3 +14,5 @@ fn main() {
 mod types;
 mod feeds;
 mod math_kernel;
+mod ai_router;
+
