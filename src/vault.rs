@@ -404,3 +404,236 @@ impl VaultLedger {
         Some(&self.journal[idx])
     }
 }
+use crate::risk::AccountRiskSnapshot;
+
+pub const DEFAULT_SYNC_INTERVAL_MS: u64 = 30_000;
+
+impl VaultLedger {
+    /// Builds a zero-allocation AccountRiskSnapshot directly for RiskEngine
+    #[inline]
+    pub fn to_risk_snapshot(&self, open_orders_count: u32) -> AccountRiskSnapshot {
+        AccountRiskSnapshot {
+            equity_usd: self.total_equity_usd(),
+            day_start_equity_usd: self.day_start_equity_usd,
+            peak_equity_usd: self.peak_equity_usd.max(self.total_equity_usd()),
+            total_gross_exposure_usd: self.total_gross_exposure_usd(),
+            open_orders_count,
+        }
+    }
+}
+
+/// Authoritative position snapshot fetched from Live Exchange API (Single Source of Truth)
+#[derive(Debug, Clone, Copy)]
+pub struct ExchangePositionTruth {
+    pub symbol_id: SymbolId,
+    pub net_qty: f64,
+    pub avg_entry_price: f64,
+    pub mark_price: f64,
+    pub is_present: bool,
+}
+
+impl ExchangePositionTruth {
+    pub const fn empty() -> Self {
+        Self {
+            symbol_id: SymbolId(0),
+            net_qty: 0.0,
+            avg_entry_price: 0.0,
+            mark_price: 0.0,
+            is_present: false,
+        }
+    }
+}
+
+/// Authoritative account & positions snapshot returned by periodic 30s Exchange Sync
+#[derive(Debug, Clone, Copy)]
+pub struct ExchangeAccountTruth {
+    pub wallet_balance_usd: f64,
+    pub positions: [ExchangePositionTruth; MAX_VAULT_SYMBOLS],
+    pub position_count: usize,
+    pub exchange_timestamp_ms: u64,
+}
+
+impl ExchangeAccountTruth {
+    pub const fn empty(wallet_balance_usd: f64, exchange_timestamp_ms: u64) -> Self {
+        Self {
+            wallet_balance_usd,
+            positions: [ExchangePositionTruth::empty(); MAX_VAULT_SYMBOLS],
+            position_count: 0,
+            exchange_timestamp_ms,
+        }
+    }
+
+    pub fn push_position(
+        &mut self,
+        symbol_id: SymbolId,
+        net_qty: f64,
+        avg_entry_price: f64,
+        mark_price: f64,
+    ) -> bool {
+        if self.position_count >= MAX_VAULT_SYMBOLS
+            || !net_qty.is_finite()
+            || !avg_entry_price.is_finite()
+            || !mark_price.is_finite()
+        {
+            return false;
+        }
+        self.positions[self.position_count] = ExchangePositionTruth {
+            symbol_id,
+            net_qty,
+            avg_entry_price: avg_entry_price.max(0.0),
+            mark_price: mark_price.max(0.0),
+            is_present: true,
+        };
+        self.position_count += 1;
+        true
+    }
+}
+
+/// Audit summary produced after reconciling local VaultLedger against Exchange truth
+#[derive(Debug, Clone, Copy)]
+pub struct ReconciliationReport {
+    pub balance_drift_usd: f64,
+    pub max_qty_drift: f64,
+    pub positions_corrected: usize,
+    pub severe_drift_detected: bool,
+    pub synced_at_ms: u64,
+}
+
+impl ReconciliationReport {
+    pub const fn clean(synced_at_ms: u64) -> Self {
+        Self {
+            balance_drift_usd: 0.0,
+            max_qty_drift: 0.0,
+            positions_corrected: 0,
+            severe_drift_detected: false,
+            synced_at_ms,
+        }
+    }
+}
+
+/// Wintermute Rule #11: Periodic 30s Exchange-vs-Vault Reconciler (Zero-Heap, Zero-Panic)
+#[derive(Debug, Clone, Copy)]
+pub struct ExchangeReconciler {
+    pub sync_interval_ms: u64,
+    pub last_sync_ms: u64,
+    pub balance_drift_alert_usd: f64,
+    pub qty_drift_tol: f64,
+    pub total_syncs: u64,
+    pub total_corrections: u64,
+}
+
+impl ExchangeReconciler {
+    pub const fn new(
+        sync_interval_ms: u64,
+        balance_drift_alert_usd: f64,
+        qty_drift_tol: f64,
+    ) -> Self {
+        Self {
+            sync_interval_ms,
+            last_sync_ms: 0,
+            balance_drift_alert_usd,
+            qty_drift_tol,
+            total_syncs: 0,
+            total_corrections: 0,
+        }
+    }
+
+    pub const fn default_30s() -> Self {
+        Self::new(DEFAULT_SYNC_INTERVAL_MS, 2.0, 1e-6)
+    }
+
+    /// True when >= 30s have elapsed since last authoritative Exchange sync
+    #[inline]
+    pub fn is_sync_due(&self, now_ms: u64) -> bool {
+        self.last_sync_ms == 0 || now_ms.saturating_sub(self.last_sync_ms) >= self.sync_interval_ms
+    }
+
+    /// Overwrites local VaultLedger drift using Exchange as Single Source of Truth
+    pub fn reconcile(
+        &mut self,
+        vault: &mut VaultLedger,
+        truth: &ExchangeAccountTruth,
+        now_ms: u64,
+    ) -> ReconciliationReport {
+        let mut report = ReconciliationReport::clean(now_ms);
+        if !truth.wallet_balance_usd.is_finite() || truth.wallet_balance_usd < 0.0 {
+            report.severe_drift_detected = true;
+            return report;
+        }
+
+        // 1. Reconcile cash/wallet balance
+        let bal_drift = truth.wallet_balance_usd - vault.cash_balance_usd;
+        report.balance_drift_usd = bal_drift;
+        if bal_drift.abs() > 1e-6 {
+            vault.cash_balance_usd = truth.wallet_balance_usd;
+        }
+        if bal_drift.abs() >= self.balance_drift_alert_usd.abs() {
+            report.severe_drift_detected = true;
+        }
+
+        // 2. Track which symbols are reported open by Exchange
+        let mut seen = [false; MAX_VAULT_SYMBOLS];
+        let count = truth.position_count.min(MAX_VAULT_SYMBOLS);
+        for i in 0..count {
+            let ex_pos = truth.positions[i];
+            if !ex_pos.is_present {
+                continue;
+            }
+            let idx = ex_pos.symbol_id.0 as usize;
+            if idx >= MAX_VAULT_SYMBOLS {
+                continue;
+            }
+            seen[idx] = true;
+
+            let local = &mut vault.positions[idx];
+            let qty_drift = (ex_pos.net_qty - local.net_qty).abs();
+            if qty_drift > report.max_qty_drift {
+                report.max_qty_drift = qty_drift;
+            }
+
+            if qty_drift > self.qty_drift_tol.max(1e-12) {
+                local.net_qty = ex_pos.net_qty;
+                local.avg_entry_price = if ex_pos.net_qty.abs() > 1e-12 {
+                    ex_pos.avg_entry_price
+                } else {
+                    0.0
+                };
+                report.positions_corrected += 1;
+                report.severe_drift_detected = true;
+            }
+            if ex_pos.mark_price > 0.0 {
+                local.last_mark_price = ex_pos.mark_price;
+            }
+            local.updated_ms = now_ms;
+        }
+
+        // 3. Clear phantom local positions that no longer exist on Exchange
+        for idx in 0..MAX_VAULT_SYMBOLS {
+            if !seen[idx] && vault.positions[idx].is_open() {
+                let phantom_qty = vault.positions[idx].net_qty.abs();
+                if phantom_qty > report.max_qty_drift {
+                    report.max_qty_drift = phantom_qty;
+                }
+                vault.positions[idx].net_qty = 0.0;
+                vault.positions[idx].avg_entry_price = 0.0;
+                vault.positions[idx].updated_ms = now_ms;
+                report.positions_corrected += 1;
+                report.severe_drift_detected = true;
+            }
+        }
+
+        // 4. Refresh peak equity watermark
+        let eq = vault.total_equity_usd();
+        if eq > vault.peak_equity_usd {
+            vault.peak_equity_usd = eq;
+        }
+
+        self.last_sync_ms = now_ms;
+        self.total_syncs = self.total_syncs.saturating_add(1);
+        self.total_corrections = self
+            .total_corrections
+            .saturating_add(report.positions_corrected as u64);
+
+        report
+    }
+}
