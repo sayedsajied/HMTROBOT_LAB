@@ -1858,3 +1858,379 @@ impl Engines46To60 {
         self.last_price = price;
     }
 }
+/// Stack-only state for custom Info-Geometry, Quantum & Field-Theory Engines 61..75
+#[derive(Debug, Clone, Copy)]
+pub struct Engines61To75 {
+    last_price: f64,
+    // E61 KL Divergence Shift
+    kl_p: [f64; 4],
+    kl_q: [f64; 4],
+    // E62 Wasserstein EMD
+    w62_p: [f64; 4],
+    w62_q: [f64; 4],
+    // E63 Fisher Information Manifold
+    fish_mu: f64,
+    fish_var: f64,
+    // E64 Schrodinger WKB Tunneling
+    sch_e: f64,
+    sch_v: f64,
+    sch_tp: f64,
+    // E65 Heisenberg Uncertainty
+    heis_dx: f64,
+    heis_dp: f64,
+    heis_prod: f64,
+    // E66 Quantum Harmonic Oscillator
+    qho_anchor: f64,
+    qho_x: f64,
+    qho_n: f64,
+    // E67 Langevin Dynamics
+    lang_v: f64,
+    lang_g: f64,
+    lang_kbt: f64,
+    // E68 Ornstein-Uhlenbeck Half-Life
+    ou68_mu: f64,
+    ou68_x: f64,
+    ou68_th: f64,
+    ou68_sig: f64,
+    // E69 Kramers Escape
+    kra_anchor: f64,
+    kra_x: f64,
+    kra_d: f64,
+    kra_k: f64,
+    // E70 Landau-Ginzburg
+    lg_phi: f64,
+    lg_r: f64,
+    // E71 Renormalization Group
+    rg_g: f64,
+    rg_beta: f64,
+    // E72 Topological Hall
+    topo_d: [f64; 3],
+    // E73 Bose-Fermi Condensate
+    bf_t: f64,
+    bf_mu: f64,
+    bf_bec: f64,
+    // E74 Casimir Vacuum Force
+    cas_d: f64,
+    cas_f: f64,
+    cas_drv: f64,
+    // E75 Feynman Path Integral
+    fey_s: [f64; 3],
+    fey_coh: f64,
+}
+
+impl Engines61To75 {
+    pub const fn new() -> Self {
+        Self {
+            last_price: 0.0,
+            kl_p: [0.25; 4],
+            kl_q: [0.25; 4],
+            w62_p: [0.25; 4],
+            w62_q: [0.25; 4],
+            fish_mu: 0.0,
+            fish_var: 1.0,
+            sch_e: 0.5,
+            sch_v: 1.5,
+            sch_tp: 0.1,
+            heis_dx: 1.0,
+            heis_dp: 1.0,
+            heis_prod: 1.0,
+            qho_anchor: 0.0,
+            qho_x: 0.0,
+            qho_n: 0.0,
+            lang_v: 0.0,
+            lang_g: 0.5,
+            lang_kbt: 1.0,
+            ou68_mu: 0.0,
+            ou68_x: 0.0,
+            ou68_th: 0.25,
+            ou68_sig: 1.0,
+            kra_anchor: 0.0,
+            kra_x: 0.0,
+            kra_d: 1.0,
+            kra_k: 0.05,
+            lg_phi: 0.0,
+            lg_r: 0.5,
+            rg_g: 0.5,
+            rg_beta: 0.0,
+            topo_d: [0.1, 0.1, 1.0],
+            bf_t: 1.0,
+            bf_mu: -0.5,
+            bf_bec: 0.0,
+            cas_d: 1.0,
+            cas_f: 0.5,
+            cas_drv: 0.0,
+            fey_s: [1.0; 3],
+            fey_coh: 0.5,
+        }
+    }
+
+    pub fn eval(&mut self, inp: &EngineTickInput, out: &mut [EngineSignal; NUM_ALPHA_ENGINES]) {
+        let price = inp.price;
+        if !price.is_finite() || price <= 0.0 {
+            return;
+        }
+        let prev_p = self.last_price;
+        let has_prev = prev_p > 0.0;
+        let ret_bps = if has_prev { ((price - prev_p) / prev_p) * 10_000.0 } else { 0.0 };
+        let spread_bps = if inp.bid > 0.0 && inp.ask > inp.bid {
+            (((inp.ask - inp.bid) / price) * 10_000.0).clamp(0.10, 10.0)
+        } else {
+            0.25
+        };
+        let top_depth = (inp.bid_sz + inp.ask_sz).max(0.1);
+        let imb_l1 = ((inp.bid_sz - inp.ask_sz) / top_depth).clamp(-1.0, 1.0);
+
+        // E61: Kullback-Leibler (KL) Divergence & Jeffreys Relative Entropy Shift
+        if has_prev {
+            let centers = [-2.0, -0.5, 0.5, 2.0];
+            let mut rw = [0.0; 4];
+            let mut rs = 0.0;
+            for i in 0..4 {
+                rw[i] = (-0.50 * (ret_bps - centers[i]).powi(2)).exp();
+                rs += rw[i];
+            }
+            let (mut ps, mut qs) = (0.0, 0.0);
+            for i in 0..4 {
+                let d = rw[i] / rs.max(1e-6);
+                self.kl_p[i] = (self.kl_p[i] * 0.60) + (d * 0.40);
+                self.kl_q[i] = (self.kl_q[i] * 0.94) + (d * 0.06);
+                ps += self.kl_p[i];
+                qs += self.kl_q[i];
+            }
+            let (mut d_pq, mut d_qp) = (0.0, 0.0);
+            for i in 0..4 {
+                self.kl_p[i] /= ps.max(1e-6);
+                self.kl_q[i] /= qs.max(1e-6);
+                let pi = self.kl_p[i].max(1e-6);
+                let qi = self.kl_q[i].max(1e-6);
+                d_pq += pi * (pi / qi).ln();
+                d_qp += qi * (qi / pi).ln();
+            }
+            let j_div = (d_pq + d_qp).max(0.0);
+            let info_dir = ((self.kl_p[2] + self.kl_p[3]) - (self.kl_q[2] + self.kl_q[3])) * 2.0;
+            out[60] = EngineSignal::sanitized(61, Timeframe::Sec15, tanh_s(info_dir * (1.0 + j_div * 4.0), 0.35), 0.75);
+        }
+
+        // E62: Wasserstein Optimal Transport & Earth Mover's Distance (EMD)
+        if has_prev {
+            let comb = ret_bps + (imb_l1 * 0.8);
+            let grid = [-2.0, -0.6, 0.6, 2.0];
+            let mut rw = [0.0; 4];
+            let mut rs = 0.0;
+            for i in 0..4 {
+                rw[i] = (-0.45 * (comb - grid[i]).powi(2)).exp();
+                rs += rw[i];
+            }
+            let (mut ps, mut qs) = (0.0, 0.0);
+            for i in 0..4 {
+                let m = rw[i] / rs.max(1e-6);
+                self.w62_p[i] = (self.w62_p[i] * 0.58) + (m * 0.42);
+                self.w62_q[i] = (self.w62_q[i] * 0.93) + (m * 0.07);
+                ps += self.w62_p[i];
+                qs += self.w62_q[i];
+            }
+            for i in 0..4 {
+                self.w62_p[i] /= ps.max(1e-6);
+                self.w62_q[i] /= qs.max(1e-6);
+            }
+            let (mut cp, mut cq, mut w1, mut flux) = (0.0, 0.0, 0.0, 0.0);
+            for i in 0..3 {
+                cp += self.w62_p[i];
+                cq += self.w62_q[i];
+                let dx = grid[i + 1] - grid[i];
+                let dc = cq - cp;
+                w1 += dc.abs() * dx;
+                flux += dc * dx;
+            }
+            out[61] = EngineSignal::sanitized(62, Timeframe::Sec1, tanh_s(flux * (1.0 + w1), 0.35), 0.75);
+        }
+
+        // E63: Fisher Information Metric & Cramer-Rao Riemannian Manifold
+        if has_prev {
+            let next_mu = (self.fish_mu * 0.84) + (ret_bps * 0.16);
+            let diff = ret_bps - next_mu;
+            let next_var = ((self.fish_var * 0.85) + (diff * diff * 0.15)).clamp(0.05, 25.0);
+            let d_mu = next_mu - self.fish_mu;
+            let d_var = next_var - self.fish_var;
+            let g11 = 1.0 / next_var;
+            let g22 = 1.0 / (2.0 * next_var * next_var);
+            let ds = ((d_mu * d_mu * g11) + (d_var * d_var * g22)).max(0.0).sqrt();
+            self.fish_mu = next_mu;
+            self.fish_var = next_var;
+            out[62] = EngineSignal::sanitized(63, Timeframe::Sec15, tanh_s(next_mu * (0.5 + ds), 0.85), 0.70);
+        }
+
+        // E64: Schrodinger Wavefunction & WKB Quantum Barrier Tunneling
+        if has_prev {
+            let inst_e = (0.5 * ret_bps * ret_bps).clamp(0.02, 25.0);
+            let opp_wall = if ret_bps >= 0.0 { inp.ask_sz } else { inp.bid_sz };
+            let inst_v = (opp_wall.max(1.0).ln() * 0.85).clamp(0.20, 15.0);
+            self.sch_e = (self.sch_e * 0.78) + (inst_e * 0.22);
+            self.sch_v = (self.sch_v * 0.85) + (inst_v * 0.15);
+            let def = (self.sch_v - self.sch_e).max(0.0);
+            let inst_t = if self.sch_e >= self.sch_v {
+                0.99
+            } else {
+                (-0.45 * spread_bps.sqrt() * def.sqrt()).clamp(-10.0, 0.0).exp()
+            };
+            self.sch_tp = (self.sch_tp * 0.72) + (inst_t * 0.28);
+            out[63] = EngineSignal::sanitized(64, Timeframe::Sec1, tanh_s(ret_bps, 1.5) * self.sch_tp, 0.75);
+        }
+
+        // E65: Heisenberg Uncertainty Principle & Minimum Wavepacket Bound
+        if has_prev {
+            let ar = ret_bps.abs();
+            self.heis_dx = ((self.heis_dx * 0.84) + (ar * 0.16)).clamp(0.05, 50.0);
+            self.heis_dp = ((self.heis_dp * 0.84) + (ar * 0.16)).clamp(0.05, 50.0);
+            self.heis_prod = (self.heis_prod * 0.75) + ((self.heis_dx * self.heis_dp) * 0.25);
+            let bound_ratio = self.heis_prod / 0.25;
+            let coh = (1.5 / (bound_ratio + 0.5)).clamp(0.15, 1.0);
+            out[64] = EngineSignal::sanitized(65, Timeframe::Sec15, tanh_s(ret_bps, 1.5) * coh, 0.65);
+        }
+
+        // E66: Quantum Harmonic Oscillator & Dirac Ladder Operators
+        if self.qho_anchor <= 0.0 {
+            self.qho_anchor = price;
+        } else {
+            let disp_x = ((price - self.qho_anchor) / self.qho_anchor) * 10_000.0;
+            let mom_p = disp_x - self.qho_x;
+            self.qho_anchor = (self.qho_anchor * 0.92) + (price * 0.08);
+            let omega = (top_depth.max(1.0).ln() * 0.35).clamp(0.40, 3.0);
+            let ham = (omega * disp_x * disp_x) + ((mom_p * mom_p) / omega);
+            let inst_n = (ham - 0.5).clamp(0.0, 15.0);
+            self.qho_n = (self.qho_n * 0.72) + (inst_n * 0.28);
+            self.qho_x = disp_x;
+            out[65] = EngineSignal::sanitized(66, Timeframe::Sec15, tanh_s(disp_x * (0.3 + self.qho_n * 0.25), 2.0), 0.70);
+        }
+
+        // E67: Langevin SDE & Fluctuation-Dissipation Theorem
+        if has_prev {
+            let ig = (top_depth.max(1.0).ln() * 0.22).clamp(0.10, 2.50);
+            self.lang_g = (self.lang_g * 0.82) + (ig * 0.18);
+            let dv = (-self.lang_g * self.lang_v * 0.25) + (ret_bps * 0.65);
+            self.lang_v = (self.lang_v * 0.60) + (dv * 0.40);
+            self.lang_kbt = ((self.lang_kbt * 0.85) + ((ret_bps * ret_bps).max(0.05) * 0.15)).clamp(0.05, 30.0);
+            let einstein_d = self.lang_kbt / self.lang_g;
+            out[66] = EngineSignal::sanitized(67, Timeframe::Sec1, tanh_s(self.lang_v * (einstein_d / 2.0).clamp(0.3, 1.5), 1.0), 0.75);
+        }
+
+        // E68: Ornstein-Uhlenbeck (OU) Mean-Reverting Velocity & Half-Life
+        if self.ou68_mu <= 0.0 {
+            self.ou68_mu = price;
+        } else {
+            let xc = ((price - self.ou68_mu) / self.ou68_mu) * 10_000.0;
+            let dx = xc - self.ou68_x;
+            self.ou68_mu = (self.ou68_mu * 0.94) + (price * 0.06);
+            let ipull = if self.ou68_x.abs() > 0.15 { (-dx / self.ou68_x).clamp(0.02, 1.50) } else { self.ou68_th };
+            self.ou68_th = ((self.ou68_th * 0.86) + (ipull * 0.14)).clamp(0.05, 1.20);
+            let resid = (dx + (self.ou68_th * self.ou68_x)).abs();
+            self.ou68_sig = ((self.ou68_sig * 0.85) + (resid * 0.15)).clamp(0.10, 20.0);
+            let sig_eq = (self.ou68_sig / (2.0 * self.ou68_th).sqrt()).max(0.10);
+            let ou_z = (xc / sig_eq).clamp(-5.0, 5.0);
+            self.ou68_x = xc;
+            let ou_sig = if self.ou68_th > 0.12 { -tanh_s(ou_z, 2.0) } else { tanh_s(ou_z, 2.5) };
+            out[67] = EngineSignal::sanitized(68, Timeframe::Sec15, ou_sig, 0.75);
+        }
+
+        // E69: Kramers Escape Rate & Bistable Double-Well Barrier
+        if self.kra_anchor <= 0.0 {
+            self.kra_anchor = price;
+        } else {
+            let rb = ((price - self.kra_anchor) / self.kra_anchor) * 10_000.0;
+            self.kra_anchor = (self.kra_anchor * 0.93) + (price * 0.07);
+            self.kra_x = ((self.kra_x * 0.75) + (rb * 0.25)).clamp(-3.5, 3.5);
+            self.kra_d = ((self.kra_d * 0.85) + ((rb * rb) * 0.15)).clamp(0.10, 25.0);
+            let dv = (1.20 * (top_depth.max(1.0).ln() * 0.30).clamp(0.30, 3.0)).max(0.20);
+            let ik = 0.65 * (-dv / self.kra_d).exp();
+            self.kra_k = (self.kra_k * 0.72) + (ik * 0.28);
+            out[68] = EngineSignal::sanitized(69, Timeframe::Sec15, tanh_s(self.kra_x, 1.2) * (self.kra_k * 2.2).clamp(0.1, 1.0), 0.70);
+        }
+
+        // E70: Landau-Ginzburg Spontaneous Symmetry Breaking
+        if has_prev {
+            let iphi = ((ret_bps * 0.8) + (imb_l1 * 1.2)).tanh();
+            self.lg_phi = (self.lg_phi * 0.72) + (iphi * 0.28);
+            let ir = 0.65 - (1.80 * self.lg_phi.abs());
+            self.lg_r = ((self.lg_r * 0.82) + (ir * 0.18)).clamp(-1.50, 1.50);
+            let boost = (1.0 - self.lg_r).clamp(0.2, 2.0);
+            out[69] = EngineSignal::sanitized(70, Timeframe::Sec1, (self.lg_phi * boost).clamp(-1.0, 1.0), 0.80);
+        }
+
+        // E71: Renormalization Group (RG) Flow & Scale-Invariant Criticality
+        if has_prev {
+            self.rg_g = ((self.rg_g * 0.82) + (ret_bps.abs() * 0.18)).clamp(0.05, 5.0);
+            let b = (-1.20 * self.rg_g * self.rg_g) + (0.45 * self.rg_g.powi(3));
+            self.rg_beta = (self.rg_beta * 0.78) + (b * 0.22);
+            let xi = (1.0 / (self.rg_g - 0.65).abs().max(0.02)).clamp(0.5, 50.0);
+            out[70] = EngineSignal::sanitized(71, Timeframe::Sec15, tanh_s(ret_bps, 2.0) * (xi / 15.0).clamp(0.2, 1.0), 0.65);
+        }
+
+        // E72: Topological Insulator, Berry Curvature & Quantum Hall Edge-State
+        if has_prev {
+            let [px, py, pz] = self.topo_d;
+            let dx = (px * 0.75) + (ret_bps * 0.25);
+            let dy = (py * 0.75) + ((imb_l1 * 2.0) * 0.25);
+            let igap = 0.85 - (ret_bps.abs() * 0.55) - (imb_l1.abs() * 0.65);
+            let dz = ((pz * 0.82) + (igap * 0.18)).clamp(-2.5, 2.5);
+            let norm = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-4);
+            let cx = py * dz - pz * dy;
+            let cy = pz * dx - px * dz;
+            let cz = px * dy - py * dx;
+            let berry = (dx * cx + dy * cy + dz * cz) / (norm * norm * norm);
+            let chern = if dz < 0.0 { dx.signum() } else { 0.0 };
+            let hall = (chern * 0.70) + (berry.clamp(-1.5, 1.5) * 0.30);
+            self.topo_d = [dx, dy, dz];
+            out[71] = EngineSignal::sanitized(72, Timeframe::Sec1, hall.clamp(-1.0, 1.0), 0.75);
+        }
+
+        // E73: Fermi-Dirac Pauli Exclusion & Bose-Einstein Liquidity Condensate
+        if has_prev {
+            let it = (ret_bps.abs() * 0.6 + (1.0 - imb_l1.abs()) * 0.8).clamp(0.10, 4.0);
+            self.bf_t = (self.bf_t * 0.82) + (it * 0.18);
+            let crowd = (ret_bps.abs() * 0.45) + (imb_l1.abs() * 0.85);
+            let imu = (-1.20 / (1.0 + crowd * 2.5)).clamp(-1.50, -0.02);
+            self.bf_mu = (self.bf_mu * 0.78) + (imu * 0.22);
+            let xa = (-self.bf_mu / self.bf_t).clamp(0.02, 10.0);
+            let n0 = 1.0 / (xa.exp() - 1.0).max(0.02);
+            let nf = 1.0 / (xa.exp() + 1.0);
+            let bec = (n0 / (n0 + nf + 2.0)).clamp(0.0, 0.99);
+            self.bf_bec = (self.bf_bec * 0.72) + (bec * 0.28);
+            out[72] = EngineSignal::sanitized(73, Timeframe::Sec1, tanh_s(ret_bps + imb_l1, 1.2) * self.bf_bec, 0.75);
+        }
+
+        // E74: Casimir Quantum Vacuum Fluctuation & Zero-Point Spread Force
+        if has_prev {
+            let raw_sp = spread_bps.max(0.25);
+            self.cas_d = ((self.cas_d * 0.78) + (raw_sp * 0.22)).clamp(0.35, 10.0);
+            let pm = ((inp.bid_sz * inp.ask_sz).max(1.0).ln() * 0.45).clamp(0.30, 4.0);
+            let icas = ((1.20 * pm) / self.cas_d.powi(4).max(0.05)).clamp(0.01, 25.0);
+            self.cas_f = (self.cas_f * 0.72) + (icas * 0.28);
+            self.cas_drv = (self.cas_drv * 0.75) + (((imb_l1 * 0.6) + (ret_bps * 0.4)) * 0.25);
+            out[73] = EngineSignal::sanitized(74, Timeframe::Sec1, tanh_s(self.cas_drv * (self.cas_f / 2.0).clamp(0.25, 1.8), 0.75), 0.70);
+        }
+
+        // E75: Feynman Path Integral & Least-Action Quantum Trajectory
+        if has_prev {
+            let vp = [-1.5, 0.0, 1.5];
+            let mut pw = [0.0; 3];
+            let mut pk = 0.0;
+            for i in 0..3 {
+                let kin = 0.5 * (ret_bps - vp[i]).powi(2);
+                let pot = (1.0 - (vp[i].signum() * imb_l1)).max(0.1) * 0.8;
+                let ia = (kin + pot).clamp(0.05, 20.0);
+                self.fey_s[i] = (self.fey_s[i] * 0.75) + (ia * 0.25);
+                pw[i] = (-self.fey_s[i] / 0.85).exp();
+                pk += pw[i];
+            }
+            let p0 = pw[0] / pk.max(1e-6);
+            let p1 = pw[1] / pk.max(1e-6);
+            let p2 = pw[2] / pk.max(1e-6);
+            let opt_dir = p2 - p0;
+            let max_p = p0.max(p1).max(p2);
+            self.fey_coh = (self.fey_coh * 0.72) + (max_p * 0.28);
+            out[74] = EngineSignal::sanitized(75, Timeframe::Sec1, (opt_dir * (0.5 + self.fey_coh)).clamp(-1.0, 1.0), 0.75);
+        }
+
+        self.last_price = price;
+    }
+}
