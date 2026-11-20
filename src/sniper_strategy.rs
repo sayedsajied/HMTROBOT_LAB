@@ -352,3 +352,312 @@ impl InventorySkewModel {
         }
     }
 }
+use crate::ai_router::AiDecision;
+use crate::types::L2OrderBook;
+
+/// Unified Jump-Trading Sniper Strategy Orchestrator (Zero-Heap, Silent, Zero-Panic)
+#[derive(Debug, Clone, Copy)]
+pub struct SniperStrategy {
+    pub config: StrategyConfig,
+    pub toxic_shield: ToxicFlowShield,
+    pub skew_model: InventorySkewModel,
+}
+
+impl SniperStrategy {
+    pub const fn new(config: StrategyConfig) -> Self {
+        Self {
+            config,
+            toxic_shield: ToxicFlowShield::new(),
+            skew_model: InventorySkewModel::new(0.45, 4.0),
+        }
+    }
+
+    /// Primary live hot-path entry using L2OrderBook snapshot
+    pub fn evaluate(
+        &mut self,
+        decision: &AiDecision,
+        batch: &AlphaBatch,
+        book: &L2OrderBook,
+        inv: &InventoryState,
+        vol_bps: f64,
+    ) -> StrategyIntent {
+        if !book.is_valid() {
+            return StrategyIntent::blocked(
+                decision.symbol_id,
+                BlockReason::InvalidMarketData,
+                inv.has_open_order,
+                0.0,
+            );
+        }
+        let (bid, ask) = match (book.best_bid(), book.best_ask()) {
+            (Some(b), Some(a)) if b.price.is_finite() && a.price.is_finite() && b.price > 0.0 && a.price > b.price => {
+                (b.price, a.price)
+            }
+            _ => {
+                return StrategyIntent::blocked(
+                    decision.symbol_id,
+                    BlockReason::InvalidMarketData,
+                    inv.has_open_order,
+                    0.0,
+                );
+            }
+        };
+
+        self.evaluate_quotes(decision, batch, bid, ask, inv, vol_bps)
+    }
+
+    /// Core deterministic decision pipeline from validated top-of-book quotes
+    pub fn evaluate_quotes(
+        &mut self,
+        decision: &AiDecision,
+        batch: &AlphaBatch,
+        bid: f64,
+        ask: f64,
+        inv: &InventoryState,
+        vol_bps: f64,
+    ) -> StrategyIntent {
+        if !bid.is_finite() || !ask.is_finite() || bid <= 0.0 || ask <= bid {
+            return StrategyIntent::blocked(
+                decision.symbol_id,
+                BlockReason::InvalidMarketData,
+                inv.has_open_order,
+                0.0,
+            );
+        }
+
+        let mid = (bid + ask) * 0.5;
+        let spread_bps = ((ask - bid) / mid) * 10_000.0;
+
+        // 1. Toxic-Flow & Whale-Sweep Assessment (Jump Pillar #3)
+        let tox = self
+            .toxic_shield
+            .evaluate(batch, decision.regime, spread_bps, self.config.max_spread_bps);
+
+        // 2. Watchdog Safe-Mode: emergency flatten if exposed, else block & cancel resting
+        if decision.safe_mode {
+            if inv.net_qty.abs() > 1e-12 {
+                let close_dir = if inv.net_qty > 0.0 {
+                    TradeDirection::Short
+                } else {
+                    TradeDirection::Long
+                };
+                let close_px = if close_dir == TradeDirection::Short { bid } else { ask };
+                return StrategyIntent {
+                    symbol_id: decision.symbol_id,
+                    direction: close_dir,
+                    style: ExecutionStyle::EmergencyClose,
+                    block_reason: BlockReason::SafeModeActive,
+                    limit_price: close_px,
+                    stop_loss_price: 0.0,
+                    take_profit_price: 0.0,
+                    size_fraction: inv.utilization(self.config.max_inventory_usd).abs().max(0.01),
+                    expected_edge_bps: 0.0,
+                    fee_hurdle_bps: 0.0,
+                    toxic_score: tox.toxic_score,
+                    cancel_open_orders: true,
+                };
+            }
+            return StrategyIntent::blocked(
+                decision.symbol_id,
+                BlockReason::SafeModeActive,
+                true,
+                tox.toxic_score,
+            );
+        }
+
+        // 3. Hard Spread Veto
+        if spread_bps > self.config.max_spread_bps {
+            return StrategyIntent::blocked(
+                decision.symbol_id,
+                BlockReason::SpreadTooWide,
+                tox.pull_resting_orders || inv.has_open_order,
+                tox.toxic_score,
+            );
+        }
+
+        // 4. Toxic-Flow Block
+        if tox.block_new_entries {
+            return StrategyIntent::blocked(
+                decision.symbol_id,
+                BlockReason::ToxicFlowShield,
+                tox.pull_resting_orders,
+                tox.toxic_score,
+            );
+        }
+
+        // 5. Regime-First AI Alpha & Confidence Thresholds
+        if !decision.alpha_score.is_finite()
+            || !decision.confidence.is_finite()
+            || decision.alpha_score.abs() < self.config.min_alpha_score
+            || decision.confidence < self.config.min_confidence
+        {
+            return StrategyIntent::blocked(
+                decision.symbol_id,
+                BlockReason::InsufficientAlpha,
+                tox.pull_resting_orders,
+                tox.toxic_score,
+            );
+        }
+
+        let direction = if decision.alpha_score > 0.0 {
+            TradeDirection::Long
+        } else {
+            TradeDirection::Short
+        };
+
+        // 6. Do not stand in front of an opposing whale sweep
+        if self.toxic_shield.is_adverse_for(direction, &tox) {
+            return StrategyIntent::blocked(
+                decision.symbol_id,
+                BlockReason::ToxicFlowShield,
+                true,
+                tox.toxic_score,
+            );
+        }
+
+        // 7. Fee-First, Maker-First Gate (3x RT Fees + Slippage for Taker)
+        let expected_edge_bps =
+            decision.alpha_score.abs() * decision.confidence * self.config.base_edge_scale_bps;
+        let is_urgent_breakout = matches!(
+            decision.regime,
+            AiRegime::VolatileBurst | AiRegime::Trending
+        );
+        let (style, fee_hurdle_bps) =
+            FeeGate::select_style(&self.config, expected_edge_bps, is_urgent_breakout, false);
+
+        if style == ExecutionStyle::None {
+            return StrategyIntent::blocked(
+                decision.symbol_id,
+                BlockReason::FailedFeeGate,
+                tox.pull_resting_orders,
+                tox.toxic_score,
+            );
+        }
+
+        // 8. Dynamic Inventory Cap & Skew Control (Jump Pillar #4)
+        let size_fraction = self.skew_model.adjust_size_fraction(
+            decision.kelly_fraction,
+            direction,
+            inv,
+            self.config.max_inventory_usd,
+        );
+        if size_fraction <= 1e-6 {
+            return StrategyIntent::blocked(
+                decision.symbol_id,
+                BlockReason::InventoryCapReached,
+                tox.pull_resting_orders,
+                tox.toxic_score,
+            );
+        }
+
+        let skew_bps = self
+            .skew_model
+            .reservation_skew_bps(inv, self.config.max_inventory_usd, vol_bps);
+        let limit_price = self
+            .skew_model
+            .skewed_limit_price(mid, bid, ask, direction, style, skew_bps);
+
+        let (stop_loss_price, take_profit_price) =
+            Self::compute_sl_tp(limit_price, direction, vol_bps, decision.sl_mult, decision.tp_skew);
+
+        StrategyIntent {
+            symbol_id: decision.symbol_id,
+            direction,
+            style,
+            block_reason: BlockReason::None,
+            limit_price,
+            stop_loss_price,
+            take_profit_price,
+            size_fraction,
+            expected_edge_bps,
+            fee_hurdle_bps,
+            toxic_score: tox.toxic_score,
+            cancel_open_orders: tox.pull_resting_orders,
+        }
+    }
+
+    /// Computes RL-tuned exchange-side Hard SL and TP prices
+    #[inline]
+    pub fn compute_sl_tp(
+        entry_price: f64,
+        dir: TradeDirection,
+        vol_bps: f64,
+        sl_mult: f64,
+        tp_skew: f64,
+    ) -> (f64, f64) {
+        if !entry_price.is_finite() || entry_price <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let eff_vol = if vol_bps.is_finite() {
+            vol_bps.clamp(2.0, 80.0)
+        } else {
+            5.0
+        };
+        let sl_bps = (eff_vol * sl_mult.clamp(0.8, 3.0)).clamp(5.0, 250.0);
+        let tp_bps = (eff_vol * tp_skew.clamp(0.5, 2.5)).clamp(6.0, 400.0);
+
+        match dir {
+            TradeDirection::Long => (
+                entry_price * (1.0 - (sl_bps / 10_000.0)),
+                entry_price * (1.0 + (tp_bps / 10_000.0)),
+            ),
+            TradeDirection::Short => (
+                entry_price * (1.0 + (sl_bps / 10_000.0)),
+                entry_price * (1.0 - (tp_bps / 10_000.0)),
+            ),
+            TradeDirection::Flat => (0.0, 0.0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod sniper_strategy_tests {
+    use super::*;
+
+    #[test]
+    fn test_fee_gate_maker_first_and_3x_taker_rule() {
+        let cfg = StrategyConfig::default_crypto();
+        // Taker hurdle = 3.0 * (2*5.0 + 1.5) = 34.5 bps
+        // Maker hurdle = 1.5 * (2*2.0 + 0.375) = 6.5625 bps
+        let (s_low, _) = FeeGate::select_style(&cfg, 4.0, true, false);
+        assert_eq!(s_low, ExecutionStyle::None);
+
+        let (s_maker, _) = FeeGate::select_style(&cfg, 12.0, true, false);
+        assert_eq!(s_maker, ExecutionStyle::MakerPostOnly);
+
+        let (s_taker, _) = FeeGate::select_style(&cfg, 36.0, true, false);
+        assert_eq!(s_taker, ExecutionStyle::TakerAggressive);
+
+        let (s_emg, _) = FeeGate::select_style(&cfg, 0.0, false, true);
+        assert_eq!(s_emg, ExecutionStyle::EmergencyClose);
+    }
+
+    #[test]
+    fn test_inventory_skew_dampens_same_side_and_preserves_reduce() {
+        let model = InventorySkewModel::new(0.5, 4.0);
+        let inv = InventoryState {
+            net_qty: 0.01,
+            avg_entry_price: 90_000.0,
+            notional_usd: 800.0, // 80% long utilized
+            unrealized_bps: 5.0,
+            has_open_order: false,
+        };
+
+        let skew = model.reservation_skew_bps(&inv, 1_000.0, 4.0);
+        assert!(skew < 0.0); // Negative skew encourages selling
+
+        let add_long = model.adjust_size_fraction(0.25, TradeDirection::Long, &inv, 1_000.0);
+        let reduce_short = model.adjust_size_fraction(0.25, TradeDirection::Short, &inv, 1_000.0);
+        assert!(add_long < 0.06);
+        assert!((reduce_short - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_sl_tp_price_orientation() {
+        let (sl_l, tp_l) = SniperStrategy::compute_sl_tp(100_000.0, TradeDirection::Long, 10.0, 1.5, 2.0);
+        assert!(sl_l < 100_000.0 && tp_l > 100_000.0);
+
+        let (sl_s, tp_s) = SniperStrategy::compute_sl_tp(100_000.0, TradeDirection::Short, 10.0, 1.5, 2.0);
+        assert!(sl_s > 100_000.0 && tp_s < 100_000.0);
+    }
+}
