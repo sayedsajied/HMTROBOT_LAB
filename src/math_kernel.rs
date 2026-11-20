@@ -1459,3 +1459,402 @@ impl Engines31To45 {
         self.last_price = price;
     }
 }
+/// Stack-only state for custom Copula, PDE, Stoch-Vol, Levy & Econophysics Engines 46..60
+#[derive(Debug, Clone, Copy)]
+pub struct Engines46To60 {
+    last_price: f64,
+    // E46 Clayton & Gumbel Copula
+    cop_tau: f64,
+    // E47 Fokker-Planck PDE
+    fp_mu: f64,
+    fp_var: f64,
+    fp_grid: [f64; 4],
+    // E48 Feynman-Kac Path-Integral
+    fk_mu: f64,
+    fk_sig: f64,
+    fk_w: [f64; 4],
+    // E49 HJB Optimal Control
+    hjb_mu: f64,
+    hjb_var: f64,
+    hjb_u: f64,
+    // E50 Heston-CIR
+    hes_v: f64,
+    hes_theta: f64,
+    hes_rho: f64,
+    // E51 SABR Smile
+    sabr_f: f64,
+    sabr_alpha: f64,
+    sabr_rho: f64,
+    sabr_nu: f64,
+    // E52 Merton Jump-Diffusion
+    mjd_sig: f64,
+    mjd_lam: f64,
+    mjd_k: f64,
+    mjd_drift: f64,
+    // E53 Bates SVJ Hybrid
+    bat_v: f64,
+    bat_jv: f64,
+    bat_imp: f64,
+    // E54 Variance Gamma Levy
+    vg_theta: f64,
+    vg_sig2: f64,
+    vg_nu: f64,
+    // E55 NIG Hyperbolic Levy
+    nig_alpha: f64,
+    nig_beta: f64,
+    nig_delta: f64,
+    // E56 Ising Spin Lattice
+    is_s1: f64,
+    is_mag: f64,
+    is_temp: f64,
+    // E57 Kuramoto Phase Sync (Self + BTC Anchor)
+    kur_th_s: f64,
+    kur_th_b: f64,
+    kur_om_s: f64,
+    kur_om_b: f64,
+    // E58 Boltzmann Free Energy
+    bol_t: f64,
+    bol_e: [f64; 4],
+    // E59 Tsallis q-Entropy
+    tsa_var: f64,
+    tsa_q: f64,
+    tsa_p: [f64; 4],
+    // E60 Renyi Multifractal
+    ren_p: [f64; 4],
+}
+
+impl Engines46To60 {
+    pub const fn new() -> Self {
+        Self {
+            last_price: 0.0,
+            cop_tau: 0.4,
+            fp_mu: 0.0,
+            fp_var: 1.0,
+            fp_grid: [0.25; 4],
+            fk_mu: 0.0,
+            fk_sig: 1.0,
+            fk_w: [0.25; 4],
+            hjb_mu: 0.0,
+            hjb_var: 1.0,
+            hjb_u: 0.0,
+            hes_v: 1.0,
+            hes_theta: 1.0,
+            hes_rho: 0.0,
+            sabr_f: 0.0,
+            sabr_alpha: 1.0,
+            sabr_rho: 0.0,
+            sabr_nu: 0.5,
+            mjd_sig: 0.8,
+            mjd_lam: 0.05,
+            mjd_k: 0.0,
+            mjd_drift: 0.0,
+            bat_v: 0.8,
+            bat_jv: 0.2,
+            bat_imp: 0.0,
+            vg_theta: 0.0,
+            vg_sig2: 1.0,
+            vg_nu: 0.25,
+            nig_alpha: 1.5,
+            nig_beta: 0.0,
+            nig_delta: 0.8,
+            is_s1: 0.0,
+            is_mag: 0.0,
+            is_temp: 1.0,
+            kur_th_s: 0.0,
+            kur_th_b: 1.0,
+            kur_om_s: 0.0,
+            kur_om_b: 0.0,
+            bol_t: 1.0,
+            bol_e: [1.0; 4],
+            tsa_var: 1.0,
+            tsa_q: 1.35,
+            tsa_p: [0.25; 4],
+            ren_p: [0.25; 4],
+        }
+    }
+
+    pub fn eval(&mut self, inp: &EngineTickInput, out: &mut [EngineSignal; NUM_ALPHA_ENGINES]) {
+        let price = inp.price;
+        if !price.is_finite() || price <= 0.0 {
+            return;
+        }
+        let prev_p = self.last_price;
+        let has_prev = prev_p > 0.0;
+        let ret_bps = if has_prev { ((price - prev_p) / prev_p) * 10_000.0 } else { 0.0 };
+        let spread_bps = if inp.bid > 0.0 && inp.ask > inp.bid {
+            (((inp.ask - inp.bid) / price) * 10_000.0).max(0.1)
+        } else {
+            0.2
+        };
+        let top_depth = (inp.bid_sz + inp.ask_sz).max(0.1);
+        let imb_l1 = ((inp.bid_sz - inp.ask_sz) / top_depth).clamp(-1.0, 1.0);
+
+        // E46: Clayton & Gumbel Archimedean Copula Asymmetric Tail-Dependence
+        if has_prev {
+            let u_curr = (1.0 / (1.0 + (-1.15 * ret_bps).exp())).clamp(0.01, 0.99);
+            let u_btc = (1.0 / (1.0 + (-1.15 * inp.btc_anchor_ret_bps).exp())).clamp(0.01, 0.99);
+            let concord = ((u_curr - 0.5) * (u_btc - 0.5) * 4.0).clamp(-0.9, 0.95);
+            self.cop_tau = ((self.cop_tau * 0.88) + (concord * 0.12)).clamp(0.05, 0.90);
+            let theta_c = ((2.0 * self.cop_tau) / (1.0 - self.cop_tau)).max(0.1);
+            let lam_low = (2.0_f64).powf(-1.0 / theta_c);
+            let theta_g = (1.0 / (1.0 - self.cop_tau)).max(1.02);
+            let lam_up = (2.0 - (2.0_f64).powf(1.0 / theta_g)).clamp(0.0, 0.99);
+            let tail_sig = if u_curr > 0.5 {
+                (u_curr - 0.5) * 2.0 * lam_up
+            } else {
+                (u_curr - 0.5) * 2.0 * lam_low
+            };
+            out[45] = EngineSignal::sanitized(46, Timeframe::Sec15, tail_sig, 0.70);
+        }
+
+        // E47: Fokker-Planck Probability Density Evolution (4-Bin Forward PDE)
+        if has_prev {
+            self.fp_mu = (self.fp_mu * 0.85) + (ret_bps * 0.15);
+            let d = ret_bps - self.fp_mu;
+            self.fp_var = ((self.fp_var * 0.85) + (d * d * 0.15)).clamp(0.05, 10.0);
+            let adv = (self.fp_mu * 0.08).clamp(-0.20, 0.20);
+            let dr = (self.fp_var * 0.02).clamp(0.01, 0.15);
+            let g = self.fp_grid;
+            let dp = [
+                (-adv * g[0]) + dr * (g[1] - g[0]),
+                (adv * (g[0] - g[1])) + dr * (g[0] - 2.0 * g[1] + g[2]),
+                (adv * (g[1] - g[2])) + dr * (g[1] - 2.0 * g[2] + g[3]),
+                (adv * g[2]) + dr * (g[2] - g[3]),
+            ];
+            let mut sum = 0.0;
+            for i in 0..4 {
+                self.fp_grid[i] = (g[i] + dp[i]).max(0.01);
+                sum += self.fp_grid[i];
+            }
+            for i in 0..4 { self.fp_grid[i] /= sum.max(1e-6); }
+            let flux = (self.fp_grid[2] + self.fp_grid[3]) - (self.fp_grid[0] + self.fp_grid[1]);
+            out[46] = EngineSignal::sanitized(47, Timeframe::Sec15, tanh_s(flux, 0.40), 0.75);
+        }
+
+        // E48: Feynman-Kac Stochastic PDE Path-Integral Expectancy Pricer
+        if has_prev {
+            self.fk_mu = (self.fk_mu * 0.85) + (ret_bps * 0.15);
+            self.fk_sig = ((self.fk_sig * 0.85) + ((ret_bps - self.fk_mu).abs() * 0.15)).max(0.20);
+            let paths = [-2.0 * self.fk_sig, -0.5 * self.fk_sig, 0.5 * self.fk_sig, 2.0 * self.fk_sig];
+            let two_var = 2.0 * self.fk_sig * self.fk_sig;
+            let pot_v = (ret_bps.abs() * 0.02).clamp(0.0, 0.5);
+            let mut raw = [0.0; 4];
+            let mut rsum = 0.0;
+            for i in 0..4 {
+                let act = ((paths[i] - self.fk_mu) * (paths[i] - self.fk_mu)) / two_var;
+                raw[i] = (-act - pot_v).exp();
+                rsum += raw[i];
+            }
+            let mut exp_bps = 0.0;
+            for i in 0..4 {
+                self.fk_w[i] = (self.fk_w[i] * 0.70) + ((raw[i] / rsum.max(1e-6)) * 0.30);
+                exp_bps += self.fk_w[i] * paths[i];
+            }
+            out[47] = EngineSignal::sanitized(48, Timeframe::Sec15, tanh_s(exp_bps, 0.90), 0.75);
+        }
+
+        // E49: Hamilton-Jacobi-Bellman (HJB) Stochastic Optimal Control
+        if has_prev {
+            self.hjb_mu = (self.hjb_mu * 0.84) + (ret_bps * 0.16);
+            let d = ret_bps - self.hjb_mu;
+            self.hjb_var = ((self.hjb_var * 0.86) + (d * d * 0.14)).max(0.08);
+            let eta = spread_bps * 0.35;
+            let denom = (0.40 * self.hjb_var) + (2.0 * eta);
+            let u_raw = (self.hjb_mu / denom).clamp(-3.0, 3.0);
+            self.hjb_u = (self.hjb_u * 0.70) + (u_raw * 0.30);
+            out[48] = EngineSignal::sanitized(49, Timeframe::Sec1, tanh_s(self.hjb_u, 1.0), 0.80);
+        }
+
+        // E50: Heston-CIR Stochastic Volatility & Spot-Vol Leverage
+        if has_prev {
+            let inst_v = (ret_bps * ret_bps).max(0.02);
+            let vp = self.hes_v.max(0.02);
+            self.hes_theta = ((self.hes_theta * 0.96) + (inst_v * 0.04)).max(0.10);
+            let dv = inst_v - vp;
+            let xi = (dv.abs() / vp.sqrt()).clamp(0.10, 5.0);
+            self.hes_v = (vp + 0.25 * (self.hes_theta - vp) + (0.20 * dv)).max(0.02);
+            let cov_s = (ret_bps * dv).clamp(-10.0, 10.0) / 10.0;
+            self.hes_rho = ((self.hes_rho * 0.85) + (cov_s * 0.15)).clamp(-0.98, 0.98);
+            let feller = (0.50 * self.hes_theta) / (xi * xi);
+            let vol_ratio = (self.hes_v / self.hes_theta).clamp(0.2, 4.0);
+            let h_sig = self.hes_rho * tanh_s(vol_ratio - 1.0, 1.0) * feller.clamp(0.25, 1.0);
+            out[49] = EngineSignal::sanitized(50, Timeframe::Sec15, h_sig, 0.70);
+        }
+
+        // E51: SABR Volatility Smile & Skew Curvature
+        if self.sabr_f <= 0.0 {
+            self.sabr_f = price;
+        } else {
+            let rb = ((price - self.sabr_f) / self.sabr_f) * 10_000.0;
+            let ar = rb.abs().max(0.05);
+            self.sabr_f = (self.sabr_f * 0.90) + (price * 0.10);
+            let da = ar - self.sabr_alpha;
+            self.sabr_alpha = ((self.sabr_alpha * 0.85) + (ar * 0.15)).clamp(0.10, 25.0);
+            self.sabr_rho = ((self.sabr_rho * 0.88) + ((rb.signum() * da.signum() * 0.85) * 0.12)).clamp(-0.95, 0.95);
+            self.sabr_nu = ((self.sabr_nu * 0.85) + ((da.abs() / self.sabr_alpha) * 0.15)).clamp(0.10, 3.5);
+            let z = (self.sabr_nu / self.sabr_alpha) * (price / self.sabr_f).ln() * 100.0;
+            let skew_shift = (0.5 * self.sabr_rho * self.sabr_nu * z)
+                + ((2.0 - 3.0 * self.sabr_rho * self.sabr_rho) / 24.0) * (self.sabr_nu * self.sabr_nu * z * z);
+            out[50] = EngineSignal::sanitized(51, Timeframe::Sec15, self.sabr_rho * tanh_s(skew_shift.abs() + 0.1, 0.35), 0.70);
+        }
+
+        // E52: Merton Jump-Diffusion (Poisson Jump Intensity & Compensated Drift)
+        if has_prev {
+            let ar = ret_bps.abs();
+            let is_j = if ar > (2.2 * self.mjd_sig) && ar > 0.6 { 1.0 } else { 0.0 };
+            self.mjd_sig = if is_j > 0.5 {
+                (self.mjd_sig * 0.96) + (ar * 0.04)
+            } else {
+                ((self.mjd_sig * 0.88) + (ar * 0.12)).clamp(0.15, 10.0)
+            };
+            self.mjd_lam = ((self.mjd_lam * 0.90) + (is_j * 0.10)).clamp(0.01, 0.99);
+            self.mjd_k = if is_j > 0.5 { (self.mjd_k * 0.65) + (ret_bps * 0.35) } else { self.mjd_k * 0.92 };
+            self.mjd_drift = (self.mjd_drift * 0.80) + ((ret_bps - (self.mjd_lam * self.mjd_k)) * 0.20);
+            out[51] = EngineSignal::sanitized(52, Timeframe::Sec1, tanh_s(self.mjd_k * self.mjd_lam + self.mjd_drift * 0.5, 1.0), 0.75);
+        }
+
+        // E53: Bates SVJ (Stochastic Vol + Coupled Price-Vol Co-Jump)
+        if has_prev {
+            let iv = (ret_bps * ret_bps).max(0.02);
+            let vp = self.bat_v.max(0.05);
+            let cj = if iv > (3.5 * vp) && iv > 1.2 { iv - vp } else { 0.0 };
+            self.bat_v = ((vp * 0.88) + (iv.min(3.0 * vp) * 0.12)).clamp(0.05, 25.0);
+            self.bat_jv = ((self.bat_jv * 0.82) + (cj * 0.18)).clamp(0.01, 50.0);
+            let j_dom = self.bat_jv / (self.bat_v + self.bat_jv).max(0.05);
+            self.bat_imp = (self.bat_imp * 0.70) + ((ret_bps * j_dom) * 0.30);
+            out[52] = EngineSignal::sanitized(53, Timeframe::Sec1, tanh_s(self.bat_imp, 1.2), 0.75);
+        }
+
+        // E54: Variance Gamma (Madan-Carr-Chang Pure Jump Levy Process)
+        if has_prev {
+            self.vg_theta = (self.vg_theta * 0.85) + ((ret_bps.max(0.0) - (-ret_bps).max(0.0)) * 0.15);
+            let csq = (ret_bps - self.vg_theta) * (ret_bps - self.vg_theta);
+            self.vg_sig2 = ((self.vg_sig2 * 0.86) + (csq * 0.14)).clamp(0.05, 30.0);
+            let n4 = (csq * csq) / (self.vg_sig2 * self.vg_sig2).max(0.01);
+            let inu = ((n4 - 3.0).max(0.0) / 3.0).clamp(0.05, 2.5);
+            self.vg_nu = (self.vg_nu * 0.88) + (inu * 0.12);
+            out[53] = EngineSignal::sanitized(54, Timeframe::Sec15, tanh_s(self.vg_theta * (1.0 + self.vg_nu), 1.2), 0.70);
+        }
+
+        // E55: Normal Inverse Gaussian (NIG) Hyperbolic Heavy-Tail Levy
+        if has_prev {
+            let ar = ret_bps.abs();
+            self.nig_delta = ((self.nig_delta * 0.86) + (ar * 0.14)).clamp(0.15, 12.0);
+            let iasym = (ret_bps / self.nig_delta).clamp(-2.5, 2.5);
+            self.nig_beta = (self.nig_beta * 0.84) + (iasym * 0.16);
+            let tsh = (ar / self.nig_delta).clamp(0.2, 4.0);
+            let ra = (self.nig_alpha * 0.85) + ((1.8 / tsh.sqrt()) * 0.15);
+            self.nig_alpha = ra.max(self.nig_beta.abs() + 0.15).clamp(0.25, 5.0);
+            let g_sub = ((self.nig_alpha * self.nig_alpha) - (self.nig_beta * self.nig_beta)).max(0.01).sqrt();
+            let nig_drift = self.nig_delta * (self.nig_beta / g_sub);
+            out[54] = EngineSignal::sanitized(55, Timeframe::Sec15, tanh_s(nig_drift, 1.1), 0.70);
+        }
+
+        // E56: Ising Ferromagnetic Spin Lattice & Phase-Transition Herd Detector
+        if has_prev {
+            let s1 = (ret_bps * 1.5).tanh();
+            let s2 = (imb_l1 * 2.5).tanh();
+            let s3 = ((self.is_s1 + s1) * 0.8).tanh();
+            let svar = ((s1 - s2).powi(2) + (s1 - s3).powi(2)) * 0.5;
+            self.is_temp = ((self.is_temp * 0.85) + (svar * 0.15)).clamp(0.15, 3.0);
+            let h_ext = (s1 + s2 + s3) / 3.0;
+            let imag = (((1.25 * self.is_mag) + h_ext) / self.is_temp).tanh();
+            self.is_mag = (self.is_mag * 0.70) + (imag * 0.30);
+            self.is_s1 = s1;
+            let cool_gate = (1.6 / (self.is_temp + 0.4)).clamp(0.2, 1.0);
+            out[55] = EngineSignal::sanitized(56, Timeframe::Sec1, self.is_mag * cool_gate, 0.80);
+        }
+
+        // E57: Kuramoto Coupled Oscillator Cross-Asset Phase-Sync (Self <-> BTC)
+        if has_prev {
+            self.kur_om_s = (self.kur_om_s * 0.80) + (ret_bps * 0.20);
+            self.kur_om_b = (self.kur_om_b * 0.80) + (inp.btc_anchor_ret_bps * 0.20);
+            let d_s = (self.kur_om_s * 0.15) + (0.225 * (self.kur_th_b - self.kur_th_s).sin());
+            let d_b = (self.kur_om_b * 0.15) + (0.225 * (self.kur_th_s - self.kur_th_b).sin());
+            self.kur_th_s = (self.kur_th_s + d_s) % std::f64::consts::TAU;
+            self.kur_th_b = (self.kur_th_b + d_b) % std::f64::consts::TAU;
+            let mc = (self.kur_th_s.cos() + self.kur_th_b.cos()) * 0.5;
+            let ms = (self.kur_th_s.sin() + self.kur_th_b.sin()) * 0.5;
+            let sync_r = (mc * mc + ms * ms).sqrt().clamp(0.0, 1.0);
+            let col_vel = (self.kur_om_s + self.kur_om_b) * 0.5;
+            out[56] = EngineSignal::sanitized(57, Timeframe::Sec15, tanh_s(col_vel, 1.0) * sync_r, 0.70);
+        }
+
+        // E58: Boltzmann-Gibbs Helmholtz Free Energy & Thermodynamic Entropy
+        if has_prev {
+            self.bol_t = ((self.bol_t * 0.86) + (ret_bps.abs().max(0.1) * 0.14)).clamp(0.20, 8.0);
+            let grid = [-2.0, -0.7, 0.7, 2.0];
+            let mut bw = [0.0; 4];
+            let mut z = 0.0;
+            for i in 0..4 {
+                let ie = ((grid[i] - ret_bps).powi(2) * 0.25).clamp(0.05, 15.0);
+                self.bol_e[i] = (self.bol_e[i] * 0.75) + (ie * 0.25);
+                bw[i] = (-self.bol_e[i] / self.bol_t).exp();
+                z += bw[i];
+            }
+            let mut p = [0.0; 4];
+            let mut ent = 0.0;
+            for i in 0..4 {
+                p[i] = bw[i] / z.max(1e-6);
+                if p[i] > 1e-6 { ent -= p[i] * p[i].ln(); }
+            }
+            let work_bias = (p[2] + p[3]) - (p[0] + p[1]);
+            let ord = (1.0 - (ent / 1.3863)).clamp(0.1, 1.0);
+            out[57] = EngineSignal::sanitized(58, Timeframe::Sec15, work_bias * ord, 0.70);
+        }
+
+        // E59: Tsallis Non-Extensive q-Entropy & Power-Law q-Gaussian Cascade
+        if has_prev {
+            let sq = ret_bps * ret_bps;
+            self.tsa_var = ((self.tsa_var * 0.88) + (sq * 0.12)).max(0.05);
+            let tr = (sq / self.tsa_var).clamp(0.1, 12.0);
+            let iq = (1.10 + (0.12 * tr)).clamp(1.05, 2.40);
+            self.tsa_q = (self.tsa_q * 0.85) + (iq * 0.15);
+            let states = [-2.0, -0.6, 0.6, 2.0];
+            let beta = 1.0 / (2.0 * self.tsa_var);
+            let mut qw = [0.0; 4];
+            let mut qs = 0.0;
+            for i in 0..4 {
+                let u = beta * (states[i] - ret_bps).powi(2);
+                let base = (1.0 - (1.0 - self.tsa_q) * u).max(1e-4);
+                qw[i] = base.powf(1.0 / (1.0 - self.tsa_q));
+                qs += qw[i];
+            }
+            for i in 0..4 {
+                self.tsa_p[i] = (self.tsa_p[i] * 0.72) + ((qw[i] / qs.max(1e-6)) * 0.28);
+            }
+            let q_skew = (self.tsa_p[2] + self.tsa_p[3]) - (self.tsa_p[0] + self.tsa_p[1]);
+            out[58] = EngineSignal::sanitized(59, Timeframe::Sec15, tanh_s(q_skew * self.tsa_q, 0.85), 0.70);
+        }
+
+        // E60: Renyi Generalized Multi-Fractal Entropy Spectrum
+        if has_prev {
+            let centers = [-2.0, -0.5, 0.5, 2.0];
+            let mut rw = [0.0; 4];
+            let mut rs = 0.0;
+            for i in 0..4 {
+                rw[i] = (-0.45 * (ret_bps - centers[i]).powi(2)).exp();
+                rs += rw[i];
+            }
+            let mut psum = 0.0;
+            for i in 0..4 {
+                self.ren_p[i] = (self.ren_p[i] * 0.78) + ((rw[i] / rs.max(1e-6)) * 0.22);
+                psum += self.ren_p[i];
+            }
+            let mut sa05 = 0.0;
+            let mut sa4 = 0.0;
+            for i in 0..4 {
+                self.ren_p[i] /= psum.max(1e-6);
+                sa05 += self.ren_p[i].max(1e-6).sqrt();
+                sa4 += self.ren_p[i].powi(4);
+            }
+            let h05 = 2.0 * sa05.ln();
+            let h4 = (-1.0 / 3.0) * sa4.max(1e-9).ln();
+            let spec_w = (h05 - h4).max(0.0);
+            let dir_b = (self.ren_p[2] + self.ren_p[3]) - (self.ren_p[0] + self.ren_p[1]);
+            out[59] = EngineSignal::sanitized(60, Timeframe::Sec15, tanh_s(dir_b * (0.5 + spec_w), 0.70), 0.70);
+        }
+
+        self.last_price = price;
+    }
+}
