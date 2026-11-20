@@ -2521,3 +2521,229 @@ impl Engines76To86 {
         self.last_price = price;
     }
 }
+/// Unified zero-allocation bank of all 86 custom alpha engines (E01..E86)
+#[derive(Debug, Clone, Copy)]
+pub struct EngineBank86 {
+    pub e01_15: Engines01To15,
+    pub e16_30: Engines16To30,
+    pub e31_45: Engines31To45,
+    pub e46_60: Engines46To60,
+    pub e61_75: Engines61To75,
+    pub e76_86: Engines76To86,
+}
+
+impl EngineBank86 {
+    pub const fn new() -> Self {
+        Self {
+            e01_15: Engines01To15::new(),
+            e16_30: Engines16To30::new(),
+            e31_45: Engines31To45::new(),
+            e46_60: Engines46To60::new(),
+            e61_75: Engines61To75::new(),
+            e76_86: Engines76To86::new(),
+        }
+    }
+
+    #[inline]
+    pub fn evaluate_all(&mut self, inp: &EngineTickInput, out: &mut [EngineSignal; NUM_ALPHA_ENGINES]) {
+        self.e01_15.eval(inp, out);
+        self.e16_30.eval(inp, out);
+        self.e31_45.eval(inp, out);
+        self.e46_60.eval(inp, out);
+        self.e61_75.eval(inp, out);
+        self.e76_86.eval(inp, out);
+    }
+}
+
+/// Per-symbol Jump/Wintermute Math Kernel (BTC / ETH / SOL) — 100% Stack, Silent, Zero-Panic
+#[derive(Debug, Clone, Copy)]
+pub struct MathKernel {
+    pub engines: EngineBank86,
+    pub tf_1s: TimeframeState,
+    pub tf_15s: TimeframeState,
+    pub tf_1m: TimeframeState,
+    pub tf_5m: TimeframeState,
+    pub last_price: f64,
+    pub last_ret_bps: f64,
+    pub ewma_vol_bps: f64,
+    pub fair_value: f64,
+    pub last_timestamp_ms: u64,
+    pub tick_count: u64,
+}
+
+impl MathKernel {
+    pub const fn new() -> Self {
+        Self {
+            engines: EngineBank86::new(),
+            tf_1s: TimeframeState::new(),
+            tf_15s: TimeframeState::new(),
+            tf_1m: TimeframeState::new(),
+            tf_5m: TimeframeState::new(),
+            last_price: 0.0,
+            last_ret_bps: 0.0,
+            ewma_vol_bps: 0.5,
+            fair_value: 0.0,
+            last_timestamp_ms: 0,
+            tick_count: 0,
+        }
+    }
+
+    /// Ingest a completed multi-timeframe OHLCV bar (1s, 15s, 1m, 5m)
+    pub fn on_bar(&mut self, tf: Timeframe, bar: OhlcvBar) {
+        match tf {
+            Timeframe::Sec1 => self.tf_1s.on_bar(bar),
+            Timeframe::Sec15 => self.tf_15s.on_bar(bar),
+            Timeframe::Min1 => self.tf_1m.on_bar(bar),
+            _ => self.tf_5m.on_bar(bar),
+        }
+    }
+
+    /// Primary live hot-path entry: L2 Book + Funding/Basis + BTC Anchor Return -> 86-Engine AlphaBatch
+    pub fn on_snapshot(
+        &mut self,
+        symbol_id: SymbolId,
+        book: &L2OrderBook,
+        fb: &FundingBasisSnapshot,
+        btc_anchor_ret_bps: f64,
+        timestamp_ms: u64,
+    ) -> AlphaBatch {
+        let dt_sec = if self.last_timestamp_ms > 0 && timestamp_ms > self.last_timestamp_ms {
+            ((timestamp_ms - self.last_timestamp_ms) as f64) / 1_000.0
+        } else {
+            0.25
+        };
+        let inp = EngineTickInput::from_snapshot(book, fb, btc_anchor_ret_bps, dt_sec);
+        self.on_tick_input(symbol_id, &inp, timestamp_ms)
+    }
+
+    /// Execute all 86 silent engines on a pre-parsed stack tick input
+    pub fn on_tick_input(
+        &mut self,
+        symbol_id: SymbolId,
+        inp: &EngineTickInput,
+        timestamp_ms: u64,
+    ) -> AlphaBatch {
+        let mut batch = AlphaBatch::empty(symbol_id, timestamp_ms);
+        if !inp.price.is_finite() || inp.price <= 0.0 {
+            return batch;
+        }
+
+        if self.last_price > 0.0 {
+            let ret_bps = ((inp.price - self.last_price) / self.last_price) * 10_000.0;
+            if ret_bps.is_finite() {
+                self.last_ret_bps = ret_bps;
+                let next_var = (self.ewma_vol_bps * self.ewma_vol_bps * 0.90) + (ret_bps * ret_bps * 0.10);
+                self.ewma_vol_bps = next_var.max(0.01).sqrt();
+            }
+        }
+
+        let total_l1 = inp.bid_sz + inp.ask_sz;
+        let micro = if inp.has_book && inp.bid > 0.0 && inp.ask > 0.0 && total_l1 > 1e-9 {
+            ((inp.bid * inp.ask_sz) + (inp.ask * inp.bid_sz)) / total_l1
+        } else {
+            inp.price
+        };
+        self.fair_value = if self.fair_value > 0.0 {
+            (self.fair_value * 0.70) + (micro * 0.30)
+        } else {
+            micro
+        };
+
+        self.engines.evaluate_all(inp, &mut batch.signals);
+        batch.finalize();
+
+        self.last_price = inp.price;
+        self.last_timestamp_ms = timestamp_ms;
+        self.tick_count = self.tick_count.saturating_add(1);
+        batch
+    }
+
+    /// Multi-timeframe EMA trend alignment in [-1.0, 1.0] for AI Regime Router
+    #[inline]
+    pub fn mtf_trend_alignment(&self) -> f64 {
+        let s1 = tanh_s(self.tf_1s.ema_spread_bps(), 3.0);
+        let s15 = tanh_s(self.tf_15s.ema_spread_bps(), 6.0);
+        let m1 = tanh_s(self.tf_1m.ema_spread_bps(), 12.0);
+        let m5 = tanh_s(self.tf_5m.ema_spread_bps(), 25.0);
+        ((s1 * 0.20) + (s15 * 0.25) + (m1 * 0.30) + (m5 * 0.25)).clamp(-1.0, 1.0)
+    }
+}
+
+#[cfg(test)]
+mod math_kernel_tests {
+    use super::*;
+
+    fn sample_tick(price: f64, bid_sz: f64, ask_sz: f64, btc_ret: f64) -> EngineTickInput {
+        EngineTickInput {
+            price,
+            bid: price - 0.5,
+            ask: price + 0.5,
+            bid_sz,
+            ask_sz,
+            top3_bid_vol: bid_sz * 3.0,
+            top3_ask_vol: ask_sz * 3.0,
+            top5_bid_vol: bid_sz * 5.0,
+            top5_ask_vol: ask_sz * 5.0,
+            b2_sz: bid_sz * 1.2,
+            a2_sz: ask_sz * 0.9,
+            spot_price: price - 0.2,
+            funding_rate: 0.0001,
+            btc_anchor_ret_bps: btc_ret,
+            dt_sec: 0.25,
+            has_book: true,
+        }
+    }
+
+    #[test]
+    fn test_all_86_engines_finite_and_bounded() {
+        let mut bank = EngineBank86::new();
+        let mut signals = [ZERO_SIGNAL; NUM_ALPHA_ENGINES];
+        let mut p = 90_000.0;
+
+        for i in 0..24 {
+            p += if i % 3 == 0 { 12.0 } else { -4.0 };
+            let inp = sample_tick(p, 18.0 + (i as f64), 11.0, 1.25);
+            bank.evaluate_all(&inp, &mut signals);
+        }
+
+        let mut active = 0usize;
+        for sig in signals.iter() {
+            assert!(sig.score.is_finite());
+            assert!(sig.confidence.is_finite());
+            assert!(sig.score >= -1.0 && sig.score <= 1.0);
+            assert!(sig.confidence >= 0.0 && sig.confidence <= 1.0);
+            if sig.confidence > 0.0 {
+                active += 1;
+            }
+        }
+        assert!(active >= 75);
+    }
+
+    #[test]
+    fn test_nan_and_zero_price_zero_panic() {
+        let mut bank = EngineBank86::new();
+        let mut signals = [ZERO_SIGNAL; NUM_ALPHA_ENGINES];
+
+        let bad_inputs = [
+            sample_tick(0.0, 0.0, 0.0, 0.0),
+            sample_tick(f64::NAN, f64::NAN, f64::INFINITY, f64::NAN),
+            sample_tick(f64::INFINITY, 10.0, 10.0, 0.0),
+        ];
+
+        for inp in bad_inputs.iter() {
+            bank.evaluate_all(inp, &mut signals);
+            for sig in signals.iter() {
+                assert!(sig.score.is_finite());
+                assert!(sig.confidence.is_finite());
+            }
+        }
+    }
+
+    #[test]
+    fn test_tanh_s_safety() {
+        assert_eq!(tanh_s(f64::NAN, 1.0), 0.0);
+        assert_eq!(tanh_s(5.0, 0.0), 0.0);
+        assert!(tanh_s(1000.0, 1.0) <= 1.0);
+        assert!(tanh_s(-1000.0, 1.0) >= -1.0);
+    }
+}
