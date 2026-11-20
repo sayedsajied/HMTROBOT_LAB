@@ -2234,3 +2234,290 @@ impl Engines61To75 {
         self.last_price = price;
     }
 }
+/// Stack-only state for custom Relativity, Fluid, Plasma & Quantum-Gravity Engines 76..86
+#[derive(Debug, Clone, Copy)]
+pub struct Engines76To86 {
+    last_price: f64,
+    // E76 Ricci Flow (2x2 metric [g00, g01, g10, g11])
+    ric_g: [f64; 4],
+    ric_r: f64,
+    ric_dir: f64,
+    // E77 Navier-Stokes Turbulence
+    ns_u: f64,
+    ns_re: f64,
+    ns_vort: f64,
+    // E78 Kolmogorov K41 Cascade
+    k41_macro: f64,
+    k41_micro: f64,
+    k41_eps: f64,
+    // E79 MHD Plasma
+    mhd_b: f64,
+    mhd_va: f64,
+    mhd_rec: f64,
+    // E80 QCD Yang-Mills
+    qcd_anchor: f64,
+    qcd_a: f64,
+    qcd_as: f64,
+    qcd_ym: f64,
+    // E81 Einstein Event Horizon
+    gr_center: f64,
+    gr_rs: f64,
+    gr_dil: f64,
+    gr_esc: f64,
+    // E82 Hawking Radiation
+    hwk_m: f64,
+    hwk_t: f64,
+    hwk_ev: f64,
+    // E83 AdS/CFT Holography
+    ads_cft: f64,
+    ads_bulk: f64,
+    ads_rt: f64,
+    // E84 String Nambu-Goto
+    str_t: f64,
+    str_ng: f64,
+    str_res: f64,
+    // E85 Loop Quantum Gravity
+    lqg_a: f64,
+    lqg_rho: f64,
+    // E86 Omni Master Consensus
+    omni_psi: [f64; 4],
+    omni_var: f64,
+}
+
+impl Engines76To86 {
+    pub const fn new() -> Self {
+        Self {
+            last_price: 0.0,
+            ric_g: [1.0, 0.0, 0.0, 1.0],
+            ric_r: 0.0,
+            ric_dir: 0.0,
+            ns_u: 0.0,
+            ns_re: 100.0,
+            ns_vort: 0.0,
+            k41_macro: 0.0,
+            k41_micro: 0.0,
+            k41_eps: 0.2,
+            mhd_b: 0.0,
+            mhd_va: 1.0,
+            mhd_rec: 0.0,
+            qcd_anchor: 0.0,
+            qcd_a: 0.0,
+            qcd_as: 0.5,
+            qcd_ym: 0.1,
+            gr_center: 0.0,
+            gr_rs: 0.5,
+            gr_dil: 1.0,
+            gr_esc: 0.5,
+            hwk_m: 1.5,
+            hwk_t: 0.4,
+            hwk_ev: 0.1,
+            ads_cft: 0.0,
+            ads_bulk: 1.0,
+            ads_rt: 0.5,
+            str_t: 0.5,
+            str_ng: 0.5,
+            str_res: 0.0,
+            lqg_a: 0.5,
+            lqg_rho: 0.2,
+            omni_psi: [0.0; 4],
+            omni_var: 1.0,
+        }
+    }
+
+    pub fn eval(&mut self, inp: &EngineTickInput, out: &mut [EngineSignal; NUM_ALPHA_ENGINES]) {
+        let price = inp.price;
+        if !price.is_finite() || price <= 0.0 {
+            return;
+        }
+        let prev_p = self.last_price;
+        let has_prev = prev_p > 0.0;
+        let ret_bps = if has_prev { ((price - prev_p) / prev_p) * 10_000.0 } else { 0.0 };
+        let spread_bps = if inp.bid > 0.0 && inp.ask > inp.bid {
+            (((inp.ask - inp.bid) / price) * 10_000.0).clamp(0.05, 25.0)
+        } else {
+            0.25
+        };
+        let top_depth = (inp.bid_sz + inp.ask_sz).max(0.1);
+        let imb_l1 = ((inp.bid_sz - inp.ask_sz) / top_depth).clamp(-1.0, 1.0);
+        let depth_ln = top_depth.max(1.0).ln();
+
+        // E76: Ricci Flow & Riemannian Manifold Scalar Curvature Singularity
+        if has_prev {
+            let g11 = (1.0 + ret_bps * ret_bps * 0.35).clamp(0.20, 10.0);
+            let g22 = (1.0 + imb_l1 * imb_l1 * 1.50).clamp(0.20, 10.0);
+            let g12 = (ret_bps * imb_l1 * 0.45).clamp(-1.5, 1.5);
+            let det_obs = ((g11 * g22) - (g12 * g12)).max(0.05);
+            let det_prev = (self.ric_g[0] * self.ric_g[3]) - (self.ric_g[1] * self.ric_g[2]);
+            let inst_r = (((g11 + g22) - 2.0) / det_obs) - (det_prev - det_obs);
+            self.ric_r = ((self.ric_r * 0.76) + (inst_r * 0.24)).clamp(-5.0, 10.0);
+            let damp = 0.82 - (self.ric_r * 0.12);
+            self.ric_g[0] = ((self.ric_g[0] * damp) + (g11 * 0.18)).clamp(0.20, 10.0);
+            self.ric_g[1] = (self.ric_g[1] * damp) + (g12 * 0.18);
+            self.ric_g[2] = self.ric_g[1];
+            self.ric_g[3] = ((self.ric_g[3] * damp) + (g22 * 0.18)).clamp(0.20, 10.0);
+            self.ric_dir = (self.ric_dir * 0.72) + (((ret_bps * 0.6) + (imb_l1 * 1.2)) * 0.28);
+            let pinch = (self.ric_r / 1.35).clamp(0.2, 1.5);
+            out[75] = EngineSignal::sanitized(76, Timeframe::Sec1, tanh_s(self.ric_dir * pinch, 1.0), 0.75);
+        }
+
+        // E77: Navier-Stokes Fluid Turbulence, Reynolds Number & Vortex Shedding
+        if has_prev {
+            let rho = depth_ln.clamp(0.5, 10.0);
+            let neg_gp = imb_l1 * 1.5;
+            let mu_v = (1.8 / (ret_bps.abs() + 0.5)).clamp(0.10, 3.5);
+            let u_prev = self.ns_u;
+            let du_adv = -0.15 * u_prev * (ret_bps - u_prev).abs();
+            let visc = (mu_v / rho) * (ret_bps - u_prev);
+            self.ns_u = ((u_prev * 0.65) + ((ret_bps + (neg_gp / rho) + du_adv + visc) * 0.35)).clamp(-15.0, 15.0);
+            let inst_re = ((rho * self.ns_u.abs().max(0.05) * 120.0) / mu_v).clamp(10.0, 5000.0);
+            self.ns_re = (self.ns_re * 0.78) + (inst_re * 0.22);
+            self.ns_vort = (self.ns_vort * 0.72) + (((self.ns_u - u_prev) * neg_gp) * 0.28);
+            let turb_gain = (self.ns_re / 450.0).clamp(0.25, 1.5);
+            out[76] = EngineSignal::sanitized(77, Timeframe::Sec1, tanh_s(self.ns_u * turb_gain, 1.5), 0.75);
+        }
+
+        // E78: Kolmogorov K41 Turbulence -5/3 Energy Cascade & Dissipation
+        if has_prev {
+            self.k41_macro = (self.k41_macro * 0.92) + (ret_bps * 0.08);
+            self.k41_micro = (self.k41_micro * 0.55) + (ret_bps * 0.45);
+            let dv = (self.k41_micro - self.k41_macro).abs().max(0.05);
+            let inst_eps = (dv.powi(3) * 0.45).clamp(0.01, 50.0);
+            self.k41_eps = (self.k41_eps * 0.78) + (inst_eps * 0.22);
+            let casc_gain = (self.k41_eps / 1.40).clamp(0.20, 1.6);
+            out[77] = EngineSignal::sanitized(78, Timeframe::Sec15, tanh_s(self.k41_micro * casc_gain, 1.2), 0.70);
+        }
+
+        // E79: Magnetohydrodynamics (MHD), Alfven Plasma Waves & Magnetic Reconnection
+        if has_prev {
+            let rho_p = depth_ln.clamp(0.25, 10.0);
+            let prev_b = self.mhd_b;
+            self.mhd_b = (prev_b * 0.75) + ((imb_l1 * 2.5) * 0.25);
+            let db_dt = (self.mhd_b - prev_b).abs();
+            let inst_va = (self.mhd_b.abs() / rho_p.sqrt()).clamp(0.05, 50.0);
+            self.mhd_va = (self.mhd_va * 0.82) + (inst_va * 0.18);
+            let eta_p = (1.2 / (rho_p + 0.5)).clamp(0.1, 2.0);
+            let inst_rec = (eta_p * db_dt) + (ret_bps.abs() * self.mhd_va * 0.05);
+            self.mhd_rec = (self.mhd_rec * 0.70) + (inst_rec * 0.30);
+            let jet_gain = (self.mhd_rec / 1.80).clamp(0.25, 1.6);
+            out[78] = EngineSignal::sanitized(79, Timeframe::Sec1, tanh_s(self.mhd_b * jet_gain, 1.2), 0.75);
+        }
+
+        // E80: Quantum Chromodynamics (QCD), Asymptotic Freedom & Yang-Mills Gauge Field
+        if self.qcd_anchor <= 0.0 {
+            self.qcd_anchor = price;
+        } else {
+            let disp_bps = ((price - self.qcd_anchor) / self.qcd_anchor) * 10_000.0;
+            self.qcd_anchor = (self.qcd_anchor * 0.92) + (price * 0.08);
+            let q_sq = (disp_bps * disp_bps + imb_l1 * imb_l1 + 1.5).max(1.5);
+            let inst_as = (1.15 / q_sq.ln().max(0.35)).clamp(0.08, 2.50);
+            self.qcd_as = (self.qcd_as * 0.80) + (inst_as * 0.20);
+            let prev_a = self.qcd_a;
+            self.qcd_a = (prev_a * 0.72) + (((disp_bps * 0.45) + (imb_l1 * 1.40)) * 0.28);
+            let f_t = (self.qcd_a - prev_a) + (self.qcd_as * self.qcd_a * imb_l1);
+            self.qcd_ym = (self.qcd_ym * 0.75) + ((0.25 * f_t * f_t).clamp(0.01, 30.0) * 0.25);
+            let deconf = if self.qcd_as < 0.45 { 1.35 } else if self.qcd_as > 0.95 { 0.35 } else { 0.85 };
+            out[79] = EngineSignal::sanitized(80, Timeframe::Sec15, tanh_s(self.qcd_a * deconf, 1.2), 0.70);
+        }
+
+        // E81: General Relativity & Schwarzschild Event Horizon Escape Velocity
+        if self.gr_center <= 0.0 {
+            self.gr_center = price;
+        } else {
+            let signed_r = ((price - self.gr_center) / self.gr_center) * 10_000.0;
+            let rad_r = signed_r.abs().max(0.15);
+            self.gr_center = (self.gr_center * 0.93) + (price * 0.07);
+            let mass_m = (depth_ln * 0.45).clamp(0.20, 6.0);
+            self.gr_rs = (self.gr_rs * 0.80) + (((2.0 * mass_m) / 4.84).clamp(0.10, 4.5) * 0.20);
+            let inst_dil = (1.0 - (self.gr_rs / rad_r)).clamp(0.01, 1.0).sqrt();
+            self.gr_dil = (self.gr_dil * 0.75) + (inst_dil * 0.25);
+            let v_esc = ((2.0 * mass_m) / rad_r).sqrt().max(0.10);
+            let kin_v = (signed_r.abs() * 0.65) + (imb_l1.abs() * 1.15);
+            self.gr_esc = (self.gr_esc * 0.72) + ((kin_v / v_esc).clamp(0.05, 5.0) * 0.28);
+            let esc_gate = if rad_r <= self.gr_rs * 1.15 || self.gr_dil < 0.35 { 0.20 } else { (self.gr_esc / 1.35).clamp(0.25, 1.3) };
+            out[80] = EngineSignal::sanitized(81, Timeframe::Sec15, tanh_s(signed_r, 1.2) * esc_gate.min(1.0), 0.75);
+        }
+
+        // E82: Hawking Radiation, Bekenstein Entropy & Black Hole Liquidity Evaporation
+        if has_prev {
+            let prev_m = self.hwk_m;
+            self.hwk_m = (prev_m * 0.78) + ((depth_ln * 0.42).clamp(0.22, 6.0) * 0.22);
+            let dm_dt = self.hwk_m - prev_m;
+            self.hwk_t = (self.hwk_t * 0.75) + ((0.85 / self.hwk_m).clamp(0.05, 5.0) * 0.25);
+            let shrink = (-dm_dt).max(0.0) * 3.5;
+            self.hwk_ev = (self.hwk_ev * 0.72) + (((0.75 / (self.hwk_m * self.hwk_m)) + shrink).clamp(0.02, 20.0) * 0.28);
+            let dir_drv = (ret_bps * 0.65) + (imb_l1 * 1.15);
+            let ev_boost = (self.hwk_ev / 1.65).clamp(0.25, 1.5);
+            out[81] = EngineSignal::sanitized(82, Timeframe::Sec1, tanh_s(dir_drv * ev_boost, 1.2), 0.70);
+        }
+
+        // E83: AdS/CFT Holographic Duality & Ryu-Takayanagi Entanglement Entropy
+        if has_prev {
+            let uv_eps = spread_bps.clamp(0.12, 8.0);
+            self.ads_cft = (self.ads_cft * 0.72) + (((ret_bps * 0.65) + (imb_l1 * 1.35)) * 0.28);
+            self.ads_bulk = (self.ads_bulk * 0.84) + ((depth_ln * 0.50).clamp(0.30, 8.0) * 0.16);
+            let corr_l = (self.ads_bulk * (1.0 + self.ads_cft.abs())).max(uv_eps * 1.05);
+            let inst_rt = (0.60 * (corr_l / uv_eps).ln()).clamp(0.05, 6.0);
+            self.ads_rt = (self.ads_rt * 0.76) + (inst_rt * 0.24);
+            let holo_g = (self.ads_rt / 1.45).clamp(0.25, 1.5);
+            out[82] = EngineSignal::sanitized(83, Timeframe::Sec15, tanh_s(self.ads_cft * holo_g, 1.2), 0.75);
+        }
+
+        // E84: String Theory, Nambu-Goto Worldsheet Tension & D-Brane Collision
+        if has_prev {
+            let gap = spread_bps.clamp(0.10, 10.0);
+            self.str_t = (self.str_t * 0.80) + ((depth_ln * 0.38).clamp(0.25, 5.0) * 0.20);
+            let x_p = gap * 0.50;
+            let ws = (1.0 + (ret_bps * ret_bps) + (x_p * x_p)).sqrt();
+            self.str_ng = (self.str_ng * 0.75) + ((self.str_t * ws).clamp(0.10, 30.0) * 0.25);
+            let inst_res = ((ret_bps * 0.55) + (imb_l1 * 1.45)) / gap.sqrt();
+            self.str_res = ((self.str_res * 0.72) + (inst_res * 0.28)).clamp(-6.0, 6.0);
+            let ng_g = (self.str_ng / 1.85).clamp(0.25, 1.5);
+            out[83] = EngineSignal::sanitized(84, Timeframe::Sec1, tanh_s(self.str_res * ng_g, 1.5), 0.75);
+        }
+
+        // E85: Loop Quantum Gravity (LQG), Spin Network Area & Planck-Scale Bounce
+        if has_prev {
+            let d_log = depth_ln.clamp(0.4, 8.0);
+            let raw_j = ((ret_bps.abs() * 0.45) + (imb_l1.abs() * 1.60)).clamp(0.5, 6.0);
+            let spin_j = ((raw_j * 2.0).round() * 0.5).max(0.5);
+            let inst_a = (0.475 * (spin_j * (spin_j + 1.0)).sqrt()).clamp(0.10, 10.0);
+            self.lqg_a = (self.lqg_a * 0.75) + (inst_a * 0.25);
+            let inst_rho = ((ret_bps.abs() * 0.28 + imb_l1.abs() * 0.55) * (d_log / 4.0)).clamp(0.05, 0.99);
+            self.lqg_rho = (self.lqg_rho * 0.72) + (inst_rho * 0.28);
+            let bounce_drv = (imb_l1 * 1.25) - (ret_bps * 0.35);
+            let rho_g = (self.lqg_rho / 0.78).clamp(0.25, 1.3);
+            out[84] = EngineSignal::sanitized(85, Timeframe::Sec1, tanh_s(bounce_drv * rho_g, 1.0), 0.75);
+        }
+
+        // E86 (GRAND FINALE): Omni-Physics Master Consensus, Coherence & Spread Veto Gate
+        if has_prev {
+            let d_log = depth_ln.clamp(0.4, 8.0);
+            let inst_psi = [
+                (imb_l1 * 1.45).tanh(),
+                (ret_bps / (self.omni_var.sqrt().max(0.35) * 1.5)).tanh(),
+                ((ret_bps * 0.60 + imb_l1 * 0.90) / spread_bps.sqrt()).tanh(),
+                ((ret_bps * d_log * 0.20) + (imb_l1 * 0.85)).tanh(),
+            ];
+            for i in 0..4 {
+                self.omni_psi[i] = (self.omni_psi[i] * 0.68) + (inst_psi[i] * 0.32);
+            }
+            let master_score = ((self.omni_psi[0] * 0.28)
+                + (self.omni_psi[1] * 0.24)
+                + (self.omni_psi[2] * 0.26)
+                + (self.omni_psi[3] * 0.22))
+                .clamp(-1.0, 1.0);
+            let sum_abs = (self.omni_psi[0].abs()
+                + self.omni_psi[1].abs()
+                + self.omni_psi[2].abs()
+                + self.omni_psi[3].abs())
+                .max(1e-6);
+            let coherence = ((self.omni_psi[0] + self.omni_psi[1] + self.omni_psi[2] + self.omni_psi[3]).abs() / sum_abs)
+                .clamp(0.0, 1.0);
+            self.omni_var = ((self.omni_var * 0.85) + (ret_bps * ret_bps * 0.15)).clamp(0.10, 40.0);
+            let conf = if spread_bps > 4.5 { 0.0 } else { coherence };
+            out[85] = EngineSignal::sanitized(86, Timeframe::Sec1, master_score * coherence, conf);
+        }
+
+        self.last_price = price;
+    }
+}
