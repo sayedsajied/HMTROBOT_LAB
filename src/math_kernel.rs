@@ -775,3 +775,329 @@ impl Engines01To15 {
         self.last_price = price;
     }
 }
+/// Stack-only state for custom Stochastic, Cross-Asset & Volatility Engines 16..30
+#[derive(Debug, Clone, Copy)]
+pub struct Engines16To30 {
+    last_price: f64,
+    k_pos: f64,
+    k_vel: f64,
+    k_p: [f64; 4],
+    k_init: bool,
+    ito_mu: f64,
+    ito_var: f64,
+    ou18_mu: f64,
+    ou18_var: f64,
+    jmp_var: f64,
+    jmp_lam: f64,
+    h_cum: f64,
+    h_max: f64,
+    h_min: f64,
+    h_std: f64,
+    h_val: f64,
+    hmm_calm: f64,
+    hmm_burst: f64,
+    ent_bins: [f64; 4],
+    wav_buf: [f64; 4],
+    mah_mean: [f64; 2],
+    mah_cov: [f64; 4],
+    eig_cov: [f64; 4],
+    ll_prev_self: f64,
+    ll_beta: f64,
+    coint_mean: f64,
+    coint_var: f64,
+    garch_eps2: f64,
+    garch_sig2: f64,
+    yz_open: f64,
+    yz_high: f64,
+    yz_low: f64,
+    yz_prev_c: f64,
+    yz_cnt: u32,
+    yz_v: [f64; 3],
+    bpv_prev_abs: f64,
+    bpv_rv: f64,
+    bpv_bv: f64,
+}
+
+impl Engines16To30 {
+    pub const fn new() -> Self {
+        Self {
+            last_price: 0.0,
+            k_pos: 0.0,
+            k_vel: 0.0,
+            k_p: [1.0, 0.0, 0.0, 1.0],
+            k_init: false,
+            ito_mu: 0.0,
+            ito_var: 0.0,
+            ou18_mu: 0.0,
+            ou18_var: 1.0,
+            jmp_var: 1.0,
+            jmp_lam: 0.0,
+            h_cum: 0.0,
+            h_max: 0.0,
+            h_min: 0.0,
+            h_std: 0.5,
+            h_val: 0.5,
+            hmm_calm: 0.85,
+            hmm_burst: 0.15,
+            ent_bins: [1.0; 4],
+            wav_buf: [0.0; 4],
+            mah_mean: [0.0; 2],
+            mah_cov: [1.0, 0.0, 0.0, 0.1],
+            eig_cov: [1.0, 0.0, 0.0, 1.0],
+            ll_prev_self: 0.0,
+            ll_beta: 0.0,
+            coint_mean: 0.0,
+            coint_var: 1.0,
+            garch_eps2: 0.5,
+            garch_sig2: 1.0,
+            yz_open: 0.0,
+            yz_high: 0.0,
+            yz_low: 0.0,
+            yz_prev_c: 0.0,
+            yz_cnt: 0,
+            yz_v: [0.2; 3],
+            bpv_prev_abs: 0.0,
+            bpv_rv: 0.5,
+            bpv_bv: 0.5,
+        }
+    }
+
+    pub fn eval(&mut self, inp: &EngineTickInput, out: &mut [EngineSignal; NUM_ALPHA_ENGINES]) {
+        let price = inp.price;
+        if !price.is_finite() || price <= 0.0 {
+            return;
+        }
+        let dt = inp.dt_sec.clamp(0.001, 60.0);
+        let prev_p = self.last_price;
+        let has_prev = prev_p > 0.0;
+        let ret_bps = if has_prev { ((price - prev_p) / prev_p) * 10_000.0 } else { 0.0 };
+        let total_l1 = (inp.bid_sz + inp.ask_sz).max(1e-9);
+        let imb_l1 = ((inp.bid_sz - inp.ask_sz) / total_l1).clamp(-1.0, 1.0);
+
+        // E16: 2x2 Matrix State-Space Kalman Filter
+        if !self.k_init {
+            self.k_pos = price;
+            self.k_vel = 0.0;
+            self.k_p = [1.0, 0.0, 0.0, 1.0];
+            self.k_init = true;
+        } else {
+            let x0 = self.k_pos + self.k_vel;
+            let [p00, p01, p10, p11] = self.k_p;
+            let pp00 = p00 + p01 + p10 + p11 + 0.01;
+            let pp01 = p01 + p11;
+            let pp10 = p10 + p11;
+            let pp11 = p11 + 0.005;
+            let innov = price - x0;
+            let s_cov = (pp00 + 0.25).max(1e-9);
+            let k0 = pp00 / s_cov;
+            let k1 = pp10 / s_cov;
+            self.k_pos = x0 + k0 * innov;
+            self.k_vel += k1 * innov;
+            self.k_p = [
+                (1.0 - k0) * pp00,
+                (1.0 - k0) * pp01,
+                (-k1 * pp00) + pp10,
+                (-k1 * pp01) + pp11,
+            ];
+            out[15] = EngineSignal::sanitized(16, Timeframe::Sec1, tanh_s((innov / price) * 10_000.0, 2.0), 0.80);
+        }
+
+        // E17: Ito's Lemma Stochastic Drift & Diffusion
+        if has_prev {
+            self.ito_mu = (self.ito_mu * 0.85) + ((ret_bps / dt) * 0.15);
+            self.ito_var = (self.ito_var * 0.85) + (((ret_bps * ret_bps) / dt) * 0.15);
+            out[16] = EngineSignal::sanitized(17, Timeframe::Sec1, tanh_s(self.ito_mu - (0.5 * self.ito_var * 0.01), 2.5), 0.70);
+        }
+
+        // E18: Ornstein-Uhlenbeck (O-U) Mean Reversion
+        if self.ou18_mu <= 0.0 {
+            self.ou18_mu = price;
+            self.ou18_var = 1.0;
+        } else {
+            self.ou18_mu += 0.18 * (price - self.ou18_mu);
+            let d = price - self.ou18_mu;
+            self.ou18_var = ((self.ou18_var * 0.85) + (d * d * 0.15)).max(1e-6);
+            out[17] = EngineSignal::sanitized(18, Timeframe::Sec15, -tanh_s(d / self.ou18_var.sqrt(), 2.0), 0.75);
+        }
+
+        // E19: Merton Jump-Diffusion Burst Detector
+        if has_prev {
+            let jr = ret_bps.abs() / self.jmp_var.sqrt().max(0.2);
+            let is_jump = if jr > 2.8 { 1.0 } else { 0.0 };
+            if is_jump == 0.0 {
+                self.jmp_var = ((self.jmp_var * 0.88) + (ret_bps * ret_bps * 0.12)).max(0.05);
+            }
+            self.jmp_lam = (self.jmp_lam * 0.85) + (is_jump * 0.15);
+            out[18] = EngineSignal::sanitized(19, Timeframe::Sec1, ret_bps.signum() * tanh_s(jr * self.jmp_lam, 0.8), 0.70);
+        }
+
+        // E20: Hurst Exponent (R/S Fractal Regime)
+        if has_prev {
+            self.h_cum = (self.h_cum * 0.85) + ret_bps;
+            self.h_max = (self.h_max * 0.90).max(self.h_cum);
+            self.h_min = (self.h_min * 0.90).min(self.h_cum);
+            let range_r = (self.h_max - self.h_min).max(0.05);
+            self.h_std = ((self.h_std * 0.88) + (ret_bps.abs() * 0.12)).max(0.05);
+            let raw_h = ((range_r / self.h_std).max(1.05).ln() / (20.0_f64).ln()).clamp(0.10, 0.90);
+            self.h_val = (self.h_val * 0.80) + (raw_h * 0.20);
+            out[19] = EngineSignal::sanitized(20, Timeframe::Sec15, (self.h_val - 0.5) * 2.5 * tanh_s(ret_bps, 2.0), 0.75);
+        }
+
+        // E21: Hidden Markov Model (HMM) Bayesian Regime Switcher
+        if has_prev {
+            let r_sq = ret_bps * ret_bps;
+            let p0 = 0.92 * self.hmm_calm + 0.20 * self.hmm_burst;
+            let p1 = 0.08 * self.hmm_calm + 0.80 * self.hmm_burst;
+            let u0 = p0 * ((-r_sq / 0.72).exp() / 0.6);
+            let u1 = p1 * ((-r_sq / 24.5).exp() / 3.5);
+            let ns = (u0 + u1).max(1e-12);
+            self.hmm_calm = u0 / ns;
+            self.hmm_burst = u1 / ns;
+            out[20] = EngineSignal::sanitized(21, Timeframe::Sec1, tanh_s(ret_bps, 2.5) * self.hmm_burst, 0.70);
+        }
+
+        // E22: Shannon Entropy Information Filter
+        if has_prev {
+            for b in self.ent_bins.iter_mut() { *b *= 0.90; }
+            if ret_bps < -1.5 { self.ent_bins[0] += 1.0; }
+            else if ret_bps < 0.0 { self.ent_bins[1] += 1.0; }
+            else if ret_bps <= 1.5 { self.ent_bins[2] += 1.0; }
+            else { self.ent_bins[3] += 1.0; }
+            let tot = (self.ent_bins[0] + self.ent_bins[1] + self.ent_bins[2] + self.ent_bins[3]).max(1.0);
+            let mut h = 0.0;
+            for b in self.ent_bins {
+                let p = b / tot;
+                if p > 0.001 { h -= p * p.log2(); }
+            }
+            let norm_h = (h / 2.0).clamp(0.0, 1.0);
+            let dir = ((self.ent_bins[2] + self.ent_bins[3]) - (self.ent_bins[0] + self.ent_bins[1])) / tot;
+            out[21] = EngineSignal::sanitized(22, Timeframe::Sec15, dir * (1.0 - norm_h), 0.70);
+        }
+
+        // E23: 4-Point Orthogonal Haar Wavelet Denoiser
+        if self.wav_buf[3] <= 0.0 {
+            self.wav_buf = [price; 4];
+        } else {
+            self.wav_buf = [self.wav_buf[1], self.wav_buf[2], self.wav_buf[3], price];
+            let s = std::f64::consts::FRAC_1_SQRT_2;
+            let [w0, w1, w2, w3] = self.wav_buf;
+            let c0 = 0.5 * (w0 + w1 + w2 + w3);
+            let c1 = 0.5 * (w0 + w1 - w2 - w3);
+            let mut c3 = s * (w2 - w3);
+            let thr = price * 0.00015;
+            c3 = if c3.abs() <= thr { 0.0 } else { c3.signum() * (c3.abs() - thr) };
+            let clean_p = (0.5 * c0) - (0.5 * c1) - (s * c3);
+            let edge = if clean_p > 0.0 { ((price - clean_p) / clean_p) * 10_000.0 } else { 0.0 };
+            out[22] = EngineSignal::sanitized(23, Timeframe::Sec1, tanh_s(edge, 1.5), 0.75);
+        }
+
+        // E24: Mahalanobis 2x2 Multivariate Anomaly
+        if has_prev {
+            let dx = ret_bps - self.mah_mean[0];
+            let dy = imb_l1 - self.mah_mean[1];
+            let a = self.mah_cov[0] + 0.05;
+            let b = self.mah_cov[1];
+            let c = self.mah_cov[2];
+            let d = self.mah_cov[3] + 0.01;
+            let det = (a * d) - (b * c);
+            let d_sq = if det.abs() > 1e-9 {
+                let ix = (d * dx - b * dy) / det;
+                let iy = (-c * dx + a * dy) / det;
+                (dx * ix + dy * iy).max(0.0)
+            } else {
+                dx * dx + dy * dy
+            };
+            self.mah_mean[0] = (self.mah_mean[0] * 0.90) + (ret_bps * 0.10);
+            self.mah_mean[1] = (self.mah_mean[1] * 0.90) + (imb_l1 * 0.10);
+            self.mah_cov[0] = (self.mah_cov[0] * 0.90) + (dx * dx * 0.10);
+            self.mah_cov[1] = (self.mah_cov[1] * 0.90) + (dx * dy * 0.10);
+            self.mah_cov[2] = self.mah_cov[1];
+            self.mah_cov[3] = (self.mah_cov[3] * 0.90) + (dy * dy * 0.10);
+            out[23] = EngineSignal::sanitized(24, Timeframe::Sec1, ret_bps.signum() * tanh_s(d_sq.sqrt() - 1.5, 2.0), 0.70);
+        }
+
+        // E25: Eigenvalue Cross-Asset Covariance Absorption Ratio (BTC Anchor)
+        if has_prev {
+            let r0 = ret_bps;
+            let r1 = inp.btc_anchor_ret_bps;
+            self.eig_cov[0] = (self.eig_cov[0] * 0.90) + (r0 * r0 * 0.10);
+            self.eig_cov[1] = (self.eig_cov[1] * 0.90) + (r0 * r1 * 0.10);
+            self.eig_cov[2] = self.eig_cov[1];
+            self.eig_cov[3] = (self.eig_cov[3] * 0.90) + (r1 * r1 * 0.10);
+            let tr = self.eig_cov[0] + self.eig_cov[3];
+            let disc = ((self.eig_cov[0] - self.eig_cov[3]).powi(2) + 4.0 * self.eig_cov[1].powi(2)).sqrt();
+            let abs_ratio = ((0.5 * (tr + disc)) / tr.abs().max(1e-6)).clamp(0.0, 1.0);
+            out[24] = EngineSignal::sanitized(25, Timeframe::Sec15, tanh_s(r0 + r1, 3.0) * abs_ratio, 0.65);
+        }
+
+        // E26: Cross-Asset Lead-Lag Matrix (BTC -> ETH/SOL)
+        if has_prev {
+            self.ll_beta = (self.ll_beta * 0.88) + (ret_bps * self.ll_prev_self * 0.12);
+            self.ll_prev_self = ret_bps;
+            let lag_gap = inp.btc_anchor_ret_bps - ret_bps;
+            let conf = if inp.btc_anchor_ret_bps.abs() > 1e-6 { 0.70 } else { 0.25 };
+            out[25] = EngineSignal::sanitized(26, Timeframe::Sec1, tanh_s(lag_gap, 2.0), conf);
+        }
+
+        // E27: Cointegration Spread Z-Score (BTC -> ETH/SOL)
+        if has_prev {
+            let spread_diff = ret_bps - inp.btc_anchor_ret_bps;
+            let diff = spread_diff - self.coint_mean;
+            self.coint_mean = (self.coint_mean * 0.90) + (spread_diff * 0.10);
+            self.coint_var = ((self.coint_var * 0.90) + (diff * diff * 0.10)).max(1e-4);
+            let conf = if inp.btc_anchor_ret_bps.abs() > 1e-6 { 0.65 } else { 0.25 };
+            out[26] = EngineSignal::sanitized(27, Timeframe::Sec15, -tanh_s(diff / self.coint_var.sqrt(), 2.1), conf);
+        }
+
+        // E28: GARCH(1,1) Conditional Volatility Clustering
+        if has_prev {
+            let cond_var = (0.05 + (0.18 * self.garch_eps2) + (0.78 * self.garch_sig2)).max(0.01);
+            let shock = ret_bps / cond_var.sqrt();
+            self.garch_eps2 = ret_bps * ret_bps;
+            self.garch_sig2 = cond_var;
+            out[27] = EngineSignal::sanitized(28, Timeframe::Sec15, tanh_s(shock, 2.2), 0.70);
+        }
+
+        // E29: Yang-Zhang Minimum-Variance Volatility
+        if self.yz_prev_c <= 0.0 {
+            self.yz_open = price;
+            self.yz_high = price;
+            self.yz_low = price;
+            self.yz_prev_c = price;
+            self.yz_cnt = 1;
+        } else {
+            self.yz_high = self.yz_high.max(price);
+            self.yz_low = self.yz_low.min(price);
+            self.yz_cnt += 1;
+            if self.yz_cnt >= 4 {
+                let o_j = (self.yz_open / self.yz_prev_c.max(1e-12)).ln() * 10_000.0;
+                let c_d = (price / self.yz_open.max(1e-12)).ln() * 10_000.0;
+                let u_h = (self.yz_high / self.yz_open.max(1e-12)).ln() * 10_000.0;
+                let d_l = (self.yz_low / self.yz_open.max(1e-12)).ln() * 10_000.0;
+                let rs = (u_h * (u_h - c_d) + d_l * (d_l - c_d)).max(0.0);
+                self.yz_v[0] = (self.yz_v[0] * 0.85) + (o_j * o_j * 0.15);
+                self.yz_v[1] = (self.yz_v[1] * 0.85) + (c_d * c_d * 0.15);
+                self.yz_v[2] = (self.yz_v[2] * 0.85) + (rs * 0.15);
+                self.yz_prev_c = price;
+                self.yz_open = price;
+                self.yz_high = price;
+                self.yz_low = price;
+                self.yz_cnt = 0;
+            }
+            let yz_sig = (self.yz_v[0] + 0.25 * self.yz_v[1] + 0.75 * self.yz_v[2]).max(0.01).sqrt();
+            out[28] = EngineSignal::sanitized(29, Timeframe::Sec15, tanh_s(ret_bps / yz_sig, 2.0), 0.65);
+        }
+
+        // E30: Realized Bipower Variation (Continuous vs Jump Separator)
+        if has_prev {
+            let abs_r = ret_bps.abs();
+            self.bpv_rv = (self.bpv_rv * 0.85) + (abs_r * abs_r * 0.15);
+            self.bpv_bv = (self.bpv_bv * 0.85) + (std::f64::consts::FRAC_PI_2 * abs_r * self.bpv_prev_abs * 0.15);
+            self.bpv_prev_abs = abs_r;
+            let jump_share = ((self.bpv_rv - self.bpv_bv).max(0.0) / self.bpv_rv.max(1e-4)).clamp(0.0, 1.0);
+            out[29] = EngineSignal::sanitized(30, Timeframe::Sec1, ret_bps.signum() * jump_share, 0.70);
+        }
+
+        self.last_price = price;
+    }
+}
