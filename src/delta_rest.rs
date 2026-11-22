@@ -179,8 +179,7 @@ mod delta_rest_tests {
         assert_eq!(delta_symbol_name(SymbolId(0)), Some("BTCUSD"));
         assert_eq!(delta_symbol_name(SymbolId(1)), Some("ETHUSD"));
         assert_eq!(delta_symbol_name(SymbolId(2)), Some("SOLUSD"));
-        aassert_eq!(delta_symbol_name(SymbolId(3)), None);
-        
+        assert_eq!(delta_symbol_name(SymbolId(3)), None);
     }
 }
 use serde_json::{json, Value};
