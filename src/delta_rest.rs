@@ -468,3 +468,260 @@ mod delta_rest_chunk2_tests {
         assert!(build_order_payload(&bad_sym).is_none());
     }
 }
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeltaLivePosition {
+    pub symbol_id: u8,
+    pub size_contracts: f64,
+    pub entry_price: f64,
+    pub unrealized_pnl: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DeltaSyncSnapshot {
+    pub wallet_balance_usd: f64,
+    pub available_balance_usd: f64,
+    pub positions: [DeltaLivePosition; 3],
+    pub synced_at_sec: u64,
+}
+
+#[inline]
+fn parse_json_f64(v: &Value) -> f64 {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+        .filter(|x| x.is_finite())
+        .unwrap_or(0.0)
+}
+
+#[inline]
+fn delta_symbol_to_index(sym: &str) -> Option<usize> {
+    match sym {
+        "BTCUSD" | "BTCUSDT" => Some(0),
+        "ETHUSD" | "ETHUSDT" => Some(1),
+        "SOLUSD" | "SOLUSDT" => Some(2),
+        _ => None,
+    }
+}
+
+/// Parses Delta V2 `/v2/wallet/balances` response -> (wallet_balance_usd, available_balance_usd)
+pub fn parse_wallet_balances_json(raw: &str) -> Option<(f64, f64)> {
+    let val: Value = serde_json::from_str(raw).ok()?;
+    let list = val.get("result")?.as_array()?;
+    let mut wallet_total = 0.0;
+    let mut avail_total = 0.0;
+    let mut found = false;
+
+    for item in list {
+        let asset = item
+            .get("asset_symbol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if matches!(asset, "USD" | "USDT" | "USDC") {
+            wallet_total += item.get("balance").map(parse_json_f64).unwrap_or(0.0);
+            avail_total += item
+                .get("available_balance")
+                .map(parse_json_f64)
+                .unwrap_or(0.0);
+            found = true;
+        }
+    }
+
+    if found && wallet_total.is_finite() && avail_total.is_finite() {
+        Some((wallet_total.max(0.0), avail_total.max(0.0)))
+    } else {
+        None
+    }
+}
+
+/// Parses Delta V2 `/v2/positions/margined` response strictly for BTC/ETH/SOL (NO GOLD)
+pub fn parse_positions_json(raw: &str) -> [DeltaLivePosition; 3] {
+    let mut out = [
+        DeltaLivePosition { symbol_id: 0, ..Default::default() },
+        DeltaLivePosition { symbol_id: 1, ..Default::default() },
+        DeltaLivePosition { symbol_id: 2, ..Default::default() },
+    ];
+
+    let val: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    let list = match val.get("result").and_then(|r| r.as_array()) {
+        Some(a) => a,
+        None => return out,
+    };
+
+    for item in list {
+        let sym = item
+            .get("product_symbol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if let Some(idx) = delta_symbol_to_index(sym) {
+            out[idx].size_contracts = item.get("size").map(parse_json_f64).unwrap_or(0.0);
+            out[idx].entry_price = item.get("entry_price").map(parse_json_f64).unwrap_or(0.0);
+            out[idx].unrealized_pnl = item
+                .get("unrealized_pnl")
+                .map(parse_json_f64)
+                .unwrap_or(0.0);
+        }
+    }
+
+    out
+}
+
+impl DeltaRestClient {
+    async fn signed_get(&self, path: &str) -> Option<String> {
+        if !self.cfg.enabled {
+            return None;
+        }
+        let ts = now_epoch_sec();
+        let sig = sign_delta_v2(&self.cfg.api_secret, "GET", ts, path, "", "");
+        let url = format!("{}{}", self.cfg.base_url, path);
+
+        let resp = self
+            .http
+            .get(&url)
+            .header("api-key", &self.cfg.api_key)
+            .header("timestamp", ts.to_string())
+            .header("signature", sig)
+            .header("User-Agent", "hmtrobot-rust")
+            .send()
+            .await
+            .ok()?;
+
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.text().await.ok()
+    }
+
+    pub async fn fetch_account_sync(&self) -> Option<DeltaSyncSnapshot> {
+        let bal_raw = self.signed_get("/v2/wallet/balances").await?;
+        let (wallet_balance_usd, available_balance_usd) = parse_wallet_balances_json(&bal_raw)?;
+        let pos_raw = self.signed_get("/v2/positions/margined").await.unwrap_or_default();
+        let positions = parse_positions_json(&pos_raw);
+
+        Some(DeltaSyncSnapshot {
+            wallet_balance_usd,
+            available_balance_usd,
+            positions,
+            synced_at_sec: now_epoch_sec(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum DeltaRestCommand {
+    PlaceOrder(DeltaOrderRequest),
+    CancelAll(Option<SymbolId>),
+}
+
+#[derive(Debug, Clone)]
+pub struct DeltaRestHandle {
+    tx: Option<mpsc::Sender<DeltaRestCommand>>,
+}
+
+impl DeltaRestHandle {
+    pub fn disabled() -> Self {
+        Self { tx: None }
+    }
+
+    #[inline]
+    pub fn is_enabled(&self) -> bool {
+        self.tx.is_some()
+    }
+
+    #[inline]
+    pub fn try_place_order(&self, req: DeltaOrderRequest) -> bool {
+        match &self.tx {
+            Some(tx) => tx.try_send(DeltaRestCommand::PlaceOrder(req)).is_ok(),
+            None => false,
+        }
+    }
+
+    #[inline]
+    pub fn try_cancel_all(&self, symbol_id: Option<SymbolId>) -> bool {
+        match &self.tx {
+            Some(tx) => tx.try_send(DeltaRestCommand::CancelAll(symbol_id)).is_ok(),
+            None => false,
+        }
+    }
+}
+
+/// Spawns non-blocking Delta REST order dispatcher + 30s balance/position reconciler
+pub fn spawn_delta_rest_worker(
+    cfg: DeltaRestConfig,
+    sync_tx: Option<mpsc::Sender<DeltaSyncSnapshot>>,
+) -> (DeltaRestHandle, Option<JoinHandle<()>>) {
+    if !cfg.enabled {
+        return (DeltaRestHandle::disabled(), None);
+    }
+
+    let client = match DeltaRestClient::new(cfg) {
+        Some(c) => c,
+        None => return (DeltaRestHandle::disabled(), None),
+    };
+
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<DeltaRestCommand>(64);
+    let task = tokio::spawn(async move {
+        let mut sync_tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                maybe_cmd = cmd_rx.recv() => {
+                    match maybe_cmd {
+                        Some(DeltaRestCommand::PlaceOrder(req)) => {
+                            let _ = client.place_order(&req).await;
+                        }
+                        Some(DeltaRestCommand::CancelAll(sym)) => {
+                            let _ = client.cancel_all_orders(sym).await;
+                        }
+                        None => break,
+                    }
+                }
+                _ = sync_tick.tick() => {
+                    if let Some(ref stx) = sync_tx {
+                        if let Some(snap) = client.fetch_account_sync().await {
+                            let _ = stx.try_send(snap);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    (DeltaRestHandle { tx: Some(cmd_tx) }, Some(task))
+}
+
+#[cfg(test)]
+mod delta_rest_chunk3_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_wallet_and_positions_ignore_gold() {
+        let bal_json = r#"{"success":true,"result":[{"asset_symbol":"USD","balance":"1250.50","available_balance":"1100.25"}]}"#;
+        let bal = parse_wallet_balances_json(bal_json);
+        assert!(bal.is_some());
+        if let Some((w, a)) = bal {
+            assert!((w - 1250.50).abs() < 1e-6);
+            assert!((a - 1100.25).abs() < 1e-6);
+        }
+
+        let pos_json = r#"{"success":true,"result":[
+            {"product_symbol":"BTCUSD","size":2,"entry_price":"60010.5","unrealized_pnl":"12.4"},
+            {"product_symbol":"PAXGUSD","size":5,"entry_price":"2600.0","unrealized_pnl":"50.0"},
+            {"product_symbol":"SOLUSD","size":-3,"entry_price":"145.0","unrealized_pnl":"-1.5"}
+        ]}"#;
+        let pos = parse_positions_json(pos_json);
+        assert!((pos[0].size_contracts - 2.0).abs() < 1e-6);
+        assert!((pos[1].size_contracts - 0.0).abs() < 1e-6);
+        assert!((pos[2].size_contracts + 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_disabled_handle_zero_panic() {
+        let h = DeltaRestHandle::disabled();
+        assert!(!h.is_enabled());
+        assert!(!h.try_cancel_all(None));
+    }
+}
