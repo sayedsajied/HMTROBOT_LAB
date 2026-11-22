@@ -179,6 +179,293 @@ mod delta_rest_tests {
         assert_eq!(delta_symbol_name(SymbolId(0)), Some("BTCUSD"));
         assert_eq!(delta_symbol_name(SymbolId(1)), Some("ETHUSD"));
         assert_eq!(delta_symbol_name(SymbolId(2)), Some("SOLUSD"));
-        assert_eq!(delta_symbol_name(SymbolId(3)), None);
+        aassert_eq!(delta_symbol_name(SymbolId(3)), None);
+        
+    }
+}
+use serde_json::{json, Value};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaOrderSide {
+    Buy,
+    Sell,
+}
+
+impl DeltaOrderSide {
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeltaOrderSide::Buy => "buy",
+            DeltaOrderSide::Sell => "sell",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaOrderType {
+    Limit,
+    Market,
+}
+
+impl DeltaOrderType {
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeltaOrderType::Limit => "limit_order",
+            DeltaOrderType::Market => "market_order",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeltaOrderRequest {
+    pub symbol_id: SymbolId,
+    pub side: DeltaOrderSide,
+    pub order_type: DeltaOrderType,
+    pub size_contracts: u64,
+    pub limit_price: Option<f64>,
+    pub post_only: bool,
+    pub reduce_only: bool,
+    pub client_order_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeltaApiResult {
+    pub ok: bool,
+    pub status_code: u16,
+    pub exchange_order_id: Option<String>,
+    pub message: String,
+}
+
+#[inline]
+pub fn now_epoch_sec() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Builds Delta Exchange V2 `/v2/orders` JSON payload (strictly BTC/ETH/SOL, NO GOLD)
+pub fn build_order_payload(req: &DeltaOrderRequest) -> Option<String> {
+    let symbol = delta_symbol_name(req.symbol_id)?;
+    if req.size_contracts == 0 {
+        return None;
+    }
+
+    let mut obj = json!({
+        "product_symbol": symbol,
+        "size": req.size_contracts,
+        "side": req.side.as_str(),
+        "order_type": req.order_type.as_str(),
+        "reduce_only": req.reduce_only,
+        "client_order_id": req.client_order_id
+    });
+
+    if req.order_type == DeltaOrderType::Limit {
+        let px = req.limit_price?;
+        if !px.is_finite() || px <= 0.0 {
+            return None;
+        }
+        if let Some(map) = obj.as_object_mut() {
+            map.insert("limit_price".to_string(), json!(format!("{:.2}", px)));
+            map.insert("time_in_force".to_string(), json!("gtc"));
+            map.insert("post_only".to_string(), json!(req.post_only));
+        }
+    }
+
+    Some(obj.to_string())
+}
+
+/// Zero-panic async Delta Exchange V2 REST client (Demo/Testnet or Live)
+pub struct DeltaRestClient {
+    pub cfg: DeltaRestConfig,
+    http: reqwest::Client,
+}
+
+impl DeltaRestClient {
+    pub fn new(cfg: DeltaRestConfig) -> Option<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(cfg.timeout_ms.clamp(1_000, 10_000)))
+            .build()
+            .ok()?;
+        Some(Self { cfg, http })
+    }
+
+    pub async fn place_order(&self, req: &DeltaOrderRequest) -> DeltaApiResult {
+        if !self.cfg.enabled {
+            return DeltaApiResult {
+                ok: false,
+                status_code: 0,
+                exchange_order_id: None,
+                message: "delta_rest_disabled".to_string(),
+            };
+        }
+
+        let payload = match build_order_payload(req) {
+            Some(p) => p,
+            None => {
+                return DeltaApiResult {
+                    ok: false,
+                    status_code: 0,
+                    exchange_order_id: None,
+                    message: "invalid_order_request".to_string(),
+                };
+            }
+        };
+
+        let path = "/v2/orders";
+        let ts = now_epoch_sec();
+        let sig = sign_delta_v2(&self.cfg.api_secret, "POST", ts, path, "", &payload);
+        let url = format!("{}{}", self.cfg.base_url, path);
+
+        let resp = match self
+            .http
+            .post(&url)
+            .header("api-key", &self.cfg.api_key)
+            .header("timestamp", ts.to_string())
+            .header("signature", sig)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "hmtrobot-rust")
+            .body(payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                return DeltaApiResult {
+                    ok: false,
+                    status_code: 0,
+                    exchange_order_id: None,
+                    message: "network_error".to_string(),
+                };
+            }
+        };
+
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        let parsed: Option<Value> = serde_json::from_str(&body).ok();
+        let success = parsed
+            .as_ref()
+            .and_then(|v| v.get("success"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let order_id = parsed
+            .as_ref()
+            .and_then(|v| v.get("result"))
+            .and_then(|r| r.get("id"))
+            .map(|id| id.to_string().trim_matches('"').to_string());
+
+        DeltaApiResult {
+            ok: (200..300).contains(&status) && success,
+            status_code: status,
+            exchange_order_id: order_id,
+            message: if success {
+                "ok".to_string()
+            } else {
+                body.chars().take(180).collect()
+            },
+        }
+    }
+
+    pub async fn cancel_all_orders(&self, symbol_id: Option<SymbolId>) -> DeltaApiResult {
+        if !self.cfg.enabled {
+            return DeltaApiResult {
+                ok: false,
+                status_code: 0,
+                exchange_order_id: None,
+                message: "delta_rest_disabled".to_string(),
+            };
+        }
+
+        let payload = match symbol_id.and_then(delta_symbol_name) {
+            Some(sym) => json!({
+                "product_symbol": sym,
+                "contract_types": "perpetual_futures"
+            })
+            .to_string(),
+            None => json!({
+                "contract_types": "perpetual_futures"
+            })
+            .to_string(),
+        };
+
+        let path = "/v2/orders/all";
+        let ts = now_epoch_sec();
+        let sig = sign_delta_v2(&self.cfg.api_secret, "DELETE", ts, path, "", &payload);
+        let url = format!("{}{}", self.cfg.base_url, path);
+
+        let resp = match self
+            .http
+            .delete(&url)
+            .header("api-key", &self.cfg.api_key)
+            .header("timestamp", ts.to_string())
+            .header("signature", sig)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "hmtrobot-rust")
+            .body(payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                return DeltaApiResult {
+                    ok: false,
+                    status_code: 0,
+                    exchange_order_id: None,
+                    message: "network_error".to_string(),
+                };
+            }
+        };
+
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        DeltaApiResult {
+            ok: (200..300).contains(&status),
+            status_code: status,
+            exchange_order_id: None,
+            message: body.chars().take(180).collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod delta_rest_chunk2_tests {
+    use super::*;
+
+    #[test]
+    fn test_build_post_only_limit_payload() {
+        let req = DeltaOrderRequest {
+            symbol_id: SymbolId(0),
+            side: DeltaOrderSide::Buy,
+            order_type: DeltaOrderType::Limit,
+            size_contracts: 1,
+            limit_price: Some(60_000.5),
+            post_only: true,
+            reduce_only: false,
+            client_order_id: "hmt_1".to_string(),
+        };
+        let payload = build_order_payload(&req);
+        assert!(payload.is_some());
+        if let Some(p) = payload {
+            assert!(p.contains("\"product_symbol\":\"BTCUSD\""));
+            assert!(p.contains("\"post_only\":true"));
+            assert!(p.contains("\"limit_price\":\"60000.50\""));
+        }
+    }
+
+    #[test]
+    fn test_reject_invalid_symbol_and_zero_size() {
+        let bad_sym = DeltaOrderRequest {
+            symbol_id: SymbolId(9),
+            side: DeltaOrderSide::Buy,
+            order_type: DeltaOrderType::Market,
+            size_contracts: 1,
+            limit_price: None,
+            post_only: false,
+            reduce_only: false,
+            client_order_id: "hmt_bad".to_string(),
+        };
+        assert!(build_order_payload(&bad_sym).is_none());
     }
 }
