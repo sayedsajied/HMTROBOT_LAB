@@ -196,7 +196,6 @@ pub fn spawn_health_server(port: u16, health: Arc<HealthState>) -> tokio::task::
     })
 }
 
-fn main() {}
 use crate::ai_router::{AiRegime, AiRouter};
 use crate::execution::{
     ExecutionEngine, ExecutionMode, ExecutionOutput, FillEvent, PaperSimConfig,
