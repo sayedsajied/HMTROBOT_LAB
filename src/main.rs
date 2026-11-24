@@ -682,6 +682,246 @@ async fn wait_for_shutdown_signal() {
         let _ = tokio::signal::ctrl_c().await;
     }
 }
+use crate::delta_rest::{spawn_delta_rest_worker, DeltaRestConfig, DeltaSyncSnapshot};
+use crate::telegram_hud::{spawn_telegram_hud, HudConfig};
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-fn main() {}
+#[tokio::main]
+async fn main() {
+    // 1. Load Render Cloud environment settings (zero panic defaults)
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(10_000);
+
+    let mode = match std::env::var("TRADING_MODE")
+        .unwrap_or_else(|_| "PAPER".to_string())
+        .to_uppercase()
+        .as_str()
+    {
+        "LIVE" => ExecutionMode::Live,
+        _ => ExecutionMode::Paper,
+    };
+
+    let initial_capital: f64 = std::env::var("INITIAL_CAPITAL_USD")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1_000.0);
+
+    let ws_url = std::env::var("DELTA_WS_URL")
+        .unwrap_or_else(|_| "wss://socket-ind.testnet.deltaex.org".to_string());
+
+    let vault_path = PathBuf::from(
+        std::env::var("VAULT_PATH").unwrap_or_else(|_| "/tmp/hmtrobot_vault.txt".to_string()),
+    );
+    let journal_path = PathBuf::from(
+        std::env::var("JOURNAL_PATH").unwrap_or_else(|_| "/tmp/hmtrobot_trades.csv".to_string()),
+    );
+
+    let tg_token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
+    let tg_chat = std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
+    let hud_cfg = HudConfig {
+        enabled: !tg_token.trim().is_empty() && !tg_chat.trim().is_empty(),
+        bot_token: tg_token,
+        chat_id: tg_chat,
+        min_alert_interval_ms: 1_500,
+        heartbeat_interval_ms: 300_000,
+        queue_capacity: 64,
+    };
+    let hud_heartbeat_ms = hud_cfg.heartbeat_interval_ms;
+
+    // 2. Spawn Telegram HUD, Render /health server & Delta REST Worker (30s Sync)
+    let (hud_handle, _hud_task) = spawn_telegram_hud(hud_cfg);
+    let health = Arc::new(HealthState::new(initial_capital));
+    let _health_task = spawn_health_server(port, Arc::clone(&health));
+
+    let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel::<DeltaSyncSnapshot>(8);
+    let _sync_tx_guard = sync_tx.clone();
+    let (delta_rest, _delta_rest_task) =
+        spawn_delta_rest_worker(DeltaRestConfig::from_env(), Some(sync_tx));
+
+    let mut bot = BotEngine::new(
+        mode,
+        initial_capital,
+        vault_path,
+        journal_path,
+        hud_handle.clone(),
+        delta_rest.clone(),
+        Arc::clone(&health),
+    );
+
+    hud_handle.try_send(HudEvent::Startup {
+        mode,
+        equity_usd: bot.vault.total_equity_usd(),
+    });
+
+    let sub_msg = r#"{"type":"subscribe","payload":{"channels":[{"name":"l2_orderbook","symbols":["BTCUSD","ETHUSD","SOLUSD"]}]}}"#;
+    let shutdown = wait_for_shutdown_signal();
+    tokio::pin!(shutdown);
+
+    // 3. 24/7 Auto-Reconnect Market Data, Live Execution & 30s Balance Sync Loop
+    let mut last_sym_ts = [now_epoch_ms(); NUM_PAIRS];
+    'supervisor: loop {
+        let conn_res = tokio::select! {
+            _ = &mut shutdown => break 'supervisor,
+            res = connect_async(&ws_url) => res,
+        };
+
+        let (ws_stream, _) = match conn_res {
+            Ok(pair) => pair,
+            Err(_) => {
+                tokio::select! {
+                    _ = &mut shutdown => break 'supervisor,
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => continue 'supervisor,
+                }
+            }
+        };
+
+        let (mut write, mut read) = ws_stream.split();
+        if write.send(Message::Text(sub_msg.to_string())).await.is_err() {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue 'supervisor;
+        }
+
+        let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => break 'supervisor,
+                _ = heartbeat_tick.tick() => {
+                    let now = now_epoch_ms();
+                    bot.maybe_emit_hud_heartbeat(now, hud_heartbeat_ms);
+                    if write.send(Message::Ping(Vec::new())).await.is_err() {
+                        break;
+                    }
+                }
+                maybe_sync = sync_rx.recv(), if delta_rest.is_enabled() => {
+                    if let Some(snap) = maybe_sync {
+                        let now = now_epoch_ms();
+                        health.record_tick(
+                            now,
+                            snap.wallet_balance_usd,
+                            bot.vault.total_closed_trades,
+                            bot.risk.breaker.is_halted(),
+                        );
+                    }
+                }
+                maybe_msg = read.next() => {
+                    match maybe_msg {
+                        Some(Ok(Message::Text(txt))) => {
+                            let now = now_epoch_ms();
+                            let btc_ret = bot.kernels[0].last_ret_bps;
+                            if let Some((sym_id, mut inp)) = parse_delta_l2_message(&txt, btc_ret, 0.25) {
+                                let idx = sym_id.0 as usize;
+                                if idx < NUM_PAIRS {
+                                    let dt = ((now.saturating_sub(last_sym_ts[idx])) as f64) / 1_000.0;
+                                    inp.dt_sec = dt.clamp(0.01, 10.0);
+                                    last_sym_ts[idx] = now;
+                                    bot.on_tick_input(sym_id, &inp, now);
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Ping(payload))) => {
+                            let _ = write.send(Message::Pong(payload)).await;
+                        }
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        tokio::select! {
+            _ = &mut shutdown => break 'supervisor,
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+        }
+    }
+
+    // 4. Graceful SIGTERM teardown (Exchange Cancel-All + Vault Save + HUD Notice)
+    let _ = delta_rest.try_cancel_all(None);
+    bot.graceful_shutdown(now_epoch_ms());
+    tokio::time::sleep(Duration::from_millis(400)).await;
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+
+    #[test]
+    fn test_qty_to_delta_contracts_no_gold() {
+        assert_eq!(qty_to_delta_contracts(SymbolId(0), 0.002), 2);
+        assert_eq!(qty_to_delta_contracts(SymbolId(1), 0.05), 5);
+        assert_eq!(qty_to_delta_contracts(SymbolId(2), 3.0), 3);
+        assert_eq!(qty_to_delta_contracts(SymbolId(3), 1.0), 0);
+    }
+
+    #[test]
+    fn test_parse_delta_l2_btc_eth_sol_and_ignore_gold() {
+        let btc_json = r#"{"type":"l2_orderbook","symbol":"BTCUSD","buy":[{"limit_price":"90000.0","size":25},{"limit_price":"89999.0","size":40}],"sell":[{"limit_price":"90001.0","size":20},{"limit_price":"90002.0","size":35}]}"#;
+        let parsed = parse_delta_l2_message(btc_json, 1.2, 0.25);
+        assert!(parsed.is_some());
+        if let Some((sym, inp)) = parsed {
+            assert_eq!(sym, SymbolId(0));
+            assert!((inp.bid - 90_000.0).abs() < 1e-6);
+            assert!((inp.ask - 90_001.0).abs() < 1e-6);
+            assert!((inp.top3_bid_vol - 65.0).abs() < 1e-6);
+        }
+
+        let gold_json = r#"{"type":"l2_orderbook","symbol":"PAXGUSD","buy":[{"limit_price":"2600.0","size":10}],"sell":[{"limit_price":"2601.0","size":10}]}"#;
+        assert!(parse_delta_l2_message(gold_json, 0.0, 0.25).is_none());
+    }
+
+    #[test]
+    fn test_bot_engine_end_to_end_zero_panic() {
+        let health = Arc::new(HealthState::new(1_000.0));
+        let hud = TelegramHudHandle::disabled();
+        let rest = DeltaRestHandle::disabled();
+        let vpath = std::env::temp_dir().join("hmtrobot_e2e_vault.txt");
+        let jpath = std::env::temp_dir().join("hmtrobot_e2e_journal.csv");
+
+        let mut bot = BotEngine::new(
+            ExecutionMode::Paper,
+            1_000.0,
+            vpath.clone(),
+            jpath.clone(),
+            hud,
+            rest,
+            Arc::clone(&health),
+        );
+
+        let inp = EngineTickInput {
+            price: 90_000.5,
+            bid: 90_000.0,
+            ask: 90_001.0,
+            bid_sz: 20.0,
+            ask_sz: 12.0,
+            top3_bid_vol: 60.0,
+            top3_ask_vol: 36.0,
+            top5_bid_vol: 100.0,
+            top5_ask_vol: 60.0,
+            b2_sz: 22.0,
+            a2_sz: 14.0,
+            spot_price: 90_000.2,
+            funding_rate: 0.0001,
+            btc_anchor_ret_bps: 0.5,
+            dt_sec: 0.25,
+            has_book: true,
+        };
+
+        let now = now_epoch_ms();
+        for i in 0..5 {
+            bot.on_tick_input(SymbolId(0), &inp, now + (i * 250));
+        }
+
+        assert_eq!(health.ticks_processed.load(Ordering::Relaxed), 5);
+        assert!(health.to_json().contains("\"status\":\"ok\""));
+        bot.graceful_shutdown(now + 2_000);
+        assert!(!health.running.load(Ordering::Relaxed));
+
+        let _ = std::fs::remove_file(&vpath);
+        let _ = std::fs::remove_file(&jpath);
+    }
+}
+
 
