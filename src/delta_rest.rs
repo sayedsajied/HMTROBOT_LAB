@@ -165,3 +165,571 @@ pub fn sign_delta_v2(
     let prehash = format!("{}{}{}{}{}", method, timestamp_sec, path, query, payload);
     hmac_sha256_hex(secret.as_bytes(), prehash.as_bytes())
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaOrderSide {
+    Buy,
+    Sell,
+}
+
+impl DeltaOrderSide {
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeltaOrderSide::Buy => "buy",
+            DeltaOrderSide::Sell => "sell",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaOrderType {
+    Limit,
+    Market,
+}
+
+impl DeltaOrderType {
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeltaOrderType::Limit => "limit_order",
+            DeltaOrderType::Market => "market_order",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeltaOrderRequest {
+    pub symbol_id: SymbolId,
+    pub side: DeltaOrderSide,
+    pub order_type: DeltaOrderType,
+    pub size_contracts: u64,
+    pub limit_price: Option<f64>,
+    pub post_only: bool,
+    pub reduce_only: bool,
+    pub client_order_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeltaApiResult {
+    pub ok: bool,
+    pub status_code: u16,
+    pub exchange_order_id: Option<String>,
+    pub message: String,
+}
+
+#[inline]
+pub fn now_epoch_sec() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Builds Delta Exchange V2 `/v2/orders` JSON payload (strictly BTC/ETH/SOL, NO GOLD)
+pub fn build_order_payload(req: &DeltaOrderRequest) -> Option<String> {
+    let symbol = delta_symbol_name(req.symbol_id)?;
+    if req.size_contracts == 0 {
+        return None;
+    }
+
+    let mut obj = json!({
+        "product_symbol": symbol,
+        "size": req.size_contracts,
+        "side": req.side.as_str(),
+        "order_type": req.order_type.as_str(),
+        "reduce_only": req.reduce_only,
+        "client_order_id": req.client_order_id
+    });
+
+    if req.order_type == DeltaOrderType::Limit {
+        let px = req.limit_price?;
+        if !px.is_finite() || px <= 0.0 {
+            return None;
+        }
+        if let Some(map) = obj.as_object_mut() {
+            map.insert("limit_price".to_string(), json!(format!("{:.2}", px)));
+            map.insert("time_in_force".to_string(), json!("gtc"));
+            map.insert("post_only".to_string(), json!(req.post_only));
+        }
+    }
+
+    Some(obj.to_string())
+}
+
+/// Zero-panic async Delta Exchange V2 REST client (Demo/Testnet or Live)
+pub struct DeltaRestClient {
+    pub cfg: DeltaRestConfig,
+    http: reqwest::Client,
+}
+
+impl DeltaRestClient {
+    pub fn new(cfg: DeltaRestConfig) -> Option<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(cfg.timeout_ms.clamp(1_000, 10_000)))
+            .build()
+            .ok()?;
+        Some(Self { cfg, http })
+    }
+
+    pub async fn place_order(&self, req: &DeltaOrderRequest) -> DeltaApiResult {
+        if !self.cfg.enabled {
+            return DeltaApiResult {
+                ok: false,
+                status_code: 0,
+                exchange_order_id: None,
+                message: "delta_rest_disabled".to_string(),
+            };
+        }
+
+        let payload = match build_order_payload(req) {
+            Some(p) => p,
+            None => {
+                return DeltaApiResult {
+                    ok: false,
+                    status_code: 0,
+                    exchange_order_id: None,
+                    message: "invalid_order_request".to_string(),
+                };
+            }
+        };
+
+        let path = "/v2/orders";
+        let ts = now_epoch_sec();
+        let sig = sign_delta_v2(&self.cfg.api_secret, "POST", ts, path, "", &payload);
+        let url = format!("{}{}", self.cfg.base_url, path);
+
+        let resp = match self
+            .http
+            .post(&url)
+            .header("api-key", &self.cfg.api_key)
+            .header("timestamp", ts.to_string())
+            .header("signature", sig)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "hmtrobot-rust")
+            .body(payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                return DeltaApiResult {
+                    ok: false,
+                    status_code: 0,
+                    exchange_order_id: None,
+                    message: "network_error".to_string(),
+                };
+            }
+        };
+
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        let parsed: Option<Value> = serde_json::from_str(&body).ok();
+        let success = parsed
+            .as_ref()
+            .and_then(|v| v.get("success"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let order_id = parsed
+            .as_ref()
+            .and_then(|v| v.get("result"))
+            .and_then(|r| r.get("id"))
+            .map(|id| id.to_string().trim_matches('"').to_string());
+
+        DeltaApiResult {
+            ok: (200..300).contains(&status) && success,
+            status_code: status,
+            exchange_order_id: order_id,
+            message: if success {
+                "ok".to_string()
+            } else {
+                body.chars().take(180).collect()
+            },
+        }
+    }
+
+    pub async fn cancel_all_orders(&self, symbol_id: Option<SymbolId>) -> DeltaApiResult {
+        if !self.cfg.enabled {
+            return DeltaApiResult {
+                ok: false,
+                status_code: 0,
+                exchange_order_id: None,
+                message: "delta_rest_disabled".to_string(),
+            };
+        }
+
+        let payload = match symbol_id.and_then(delta_symbol_name) {
+            Some(sym) => json!({
+                "product_symbol": sym,
+                "contract_types": "perpetual_futures"
+            })
+            .to_string(),
+            None => json!({
+                "contract_types": "perpetual_futures"
+            })
+            .to_string(),
+        };
+
+        let path = "/v2/orders/all";
+        let ts = now_epoch_sec();
+        let sig = sign_delta_v2(&self.cfg.api_secret, "DELETE", ts, path, "", &payload);
+        let url = format!("{}{}", self.cfg.base_url, path);
+
+        let resp = match self
+            .http
+            .delete(&url)
+            .header("api-key", &self.cfg.api_key)
+            .header("timestamp", ts.to_string())
+            .header("signature", sig)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "hmtrobot-rust")
+            .body(payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                return DeltaApiResult {
+                    ok: false,
+                    status_code: 0,
+                    exchange_order_id: None,
+                    message: "network_error".to_string(),
+                };
+            }
+        };
+
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        DeltaApiResult {
+            ok: (200..300).contains(&status),
+            status_code: status,
+            exchange_order_id: None,
+            message: body.chars().take(180).collect(),
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeltaLivePosition {
+    pub symbol_id: u8,
+    pub size_contracts: f64,
+    pub entry_price: f64,
+    pub unrealized_pnl: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DeltaSyncSnapshot {
+    pub wallet_balance_usd: f64,
+    pub available_balance_usd: f64,
+    pub positions: [DeltaLivePosition; 3],
+    pub synced_at_sec: u64,
+}
+
+#[inline]
+fn parse_json_f64(v: &Value) -> f64 {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+        .filter(|x| x.is_finite())
+        .unwrap_or(0.0)
+}
+
+#[inline]
+fn delta_symbol_to_index(sym: &str) -> Option<usize> {
+    match sym {
+        "BTCUSD" | "BTCUSDT" => Some(0),
+        "ETHUSD" | "ETHUSDT" => Some(1),
+        "SOLUSD" | "SOLUSDT" => Some(2),
+        _ => None,
+    }
+}
+
+/// Parses Delta V2 `/v2/wallet/balances` response -> (wallet_balance_usd, available_balance_usd)
+pub fn parse_wallet_balances_json(raw: &str) -> Option<(f64, f64)> {
+    let val: Value = serde_json::from_str(raw).ok()?;
+    let list = val.get("result")?.as_array()?;
+    let mut wallet_total = 0.0;
+    let mut avail_total = 0.0;
+    let mut found = false;
+
+    for item in list {
+        let asset = item
+            .get("asset_symbol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if matches!(asset, "USD" | "USDT" | "USDC") {
+            wallet_total += item.get("balance").map(parse_json_f64).unwrap_or(0.0);
+            avail_total += item
+                .get("available_balance")
+                .map(parse_json_f64)
+                .unwrap_or(0.0);
+            found = true;
+        }
+    }
+
+    if found && wallet_total.is_finite() && avail_total.is_finite() {
+        Some((wallet_total.max(0.0), avail_total.max(0.0)))
+    } else {
+        None
+    }
+}
+
+/// Parses Delta V2 `/v2/positions/margined` response strictly for BTC/ETH/SOL (NO GOLD)
+pub fn parse_positions_json(raw: &str) -> [DeltaLivePosition; 3] {
+    let mut out = [
+        DeltaLivePosition { symbol_id: 0, ..Default::default() },
+        DeltaLivePosition { symbol_id: 1, ..Default::default() },
+        DeltaLivePosition { symbol_id: 2, ..Default::default() },
+    ];
+
+    let val: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    let list = match val.get("result").and_then(|r| r.as_array()) {
+        Some(a) => a,
+        None => return out,
+    };
+
+    for item in list {
+        let sym = item
+            .get("product_symbol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if let Some(idx) = delta_symbol_to_index(sym) {
+            out[idx].size_contracts = item.get("size").map(parse_json_f64).unwrap_or(0.0);
+            out[idx].entry_price = item.get("entry_price").map(parse_json_f64).unwrap_or(0.0);
+            out[idx].unrealized_pnl = item
+                .get("unrealized_pnl")
+                .map(parse_json_f64)
+                .unwrap_or(0.0);
+        }
+    }
+
+    out
+}
+
+impl DeltaRestClient {
+    async fn signed_get(&self, path: &str) -> Option<String> {
+        if !self.cfg.enabled {
+            return None;
+        }
+        let ts = now_epoch_sec();
+        let sig = sign_delta_v2(&self.cfg.api_secret, "GET", ts, path, "", "");
+        let url = format!("{}{}", self.cfg.base_url, path);
+
+        let resp = match self
+            .http
+            .get(&url)
+            .header("api-key", &self.cfg.api_key)
+            .header("timestamp", ts.to_string())
+            .header("signature", sig)
+            .header("User-Agent", "hmtrobot-rust")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[DELTA_REST] GET {} network error: {}", path, e);
+                return None;
+            }
+        };
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let snippet: String = body.chars().take(180).collect();
+            eprintln!("[DELTA_REST] GET {} HTTP {} body={}", path, status.as_u16(), snippet);
+            return None;
+        }
+        Some(body)
+    }
+
+    pub async fn fetch_account_sync(&self) -> Option<DeltaSyncSnapshot> {
+        let bal_raw = self.signed_get("/v2/wallet/balances").await?;
+        let (wallet_balance_usd, available_balance_usd) = parse_wallet_balances_json(&bal_raw)?;
+        let pos_raw = self.signed_get("/v2/positions/margined").await.unwrap_or_default();
+        let positions = parse_positions_json(&pos_raw);
+
+        Some(DeltaSyncSnapshot {
+            wallet_balance_usd,
+            available_balance_usd,
+            positions,
+            synced_at_sec: now_epoch_sec(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum DeltaRestCommand {
+    PlaceOrder(DeltaOrderRequest),
+    CancelAll(Option<SymbolId>),
+}
+
+#[derive(Debug, Clone)]
+pub struct DeltaRestHandle {
+    tx: Option<mpsc::Sender<DeltaRestCommand>>,
+}
+
+impl DeltaRestHandle {
+    pub fn disabled() -> Self {
+        Self { tx: None }
+    }
+
+    #[inline]
+    pub fn is_enabled(&self) -> bool {
+        self.tx.is_some()
+    }
+
+    #[inline]
+    pub fn try_place_order(&self, req: DeltaOrderRequest) -> bool {
+        match &self.tx {
+            Some(tx) => tx.try_send(DeltaRestCommand::PlaceOrder(req)).is_ok(),
+            None => false,
+        }
+    }
+
+    #[inline]
+    pub fn try_cancel_all(&self, symbol_id: Option<SymbolId>) -> bool {
+        match &self.tx {
+            Some(tx) => tx.try_send(DeltaRestCommand::CancelAll(symbol_id)).is_ok(),
+            None => false,
+        }
+    }
+}
+
+/// Spawns non-blocking Delta REST order dispatcher + 30s balance/position reconciler
+pub fn spawn_delta_rest_worker(
+    cfg: DeltaRestConfig,
+    sync_tx: Option<mpsc::Sender<DeltaSyncSnapshot>>,
+) -> (DeltaRestHandle, Option<JoinHandle<()>>) {
+    if !cfg.enabled {
+        eprintln!("[DELTA_REST] DISABLED: DELTA_API_KEY or DELTA_API_SECRET missing in Render ENV");
+        return (DeltaRestHandle::disabled(), None);
+    }
+
+    let base_url_log = cfg.base_url.clone();
+    let client = match DeltaRestClient::new(cfg) {
+        Some(c) => c,
+        None => {
+            eprintln!("[DELTA_REST] FAILED to build HTTP client");
+            return (DeltaRestHandle::disabled(), None);
+        }
+    };
+
+    eprintln!("[DELTA_REST] WORKER STARTED | url={}", base_url_log);
+
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<DeltaRestCommand>(64);
+    let task = tokio::spawn(async move {
+        let mut sync_tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                maybe_cmd = cmd_rx.recv() => {
+                    match maybe_cmd {
+                        Some(DeltaRestCommand::PlaceOrder(req)) => {
+                            let res = client.place_order(&req).await;
+                            eprintln!(
+                                "[DELTA_ORDER] sym={:?} side={:?} sz={} ok={} status={} id={:?} msg={}",
+                                req.symbol_id, req.side, req.size_contracts, res.ok, res.status_code, res.exchange_order_id, res.message
+                            );
+                        }
+                        Some(DeltaRestCommand::CancelAll(sym)) => {
+                            let res = client.cancel_all_orders(sym).await;
+                            eprintln!(
+                                "[DELTA_CANCEL_ALL] sym={:?} ok={} status={} msg={}",
+                                sym, res.ok, res.status_code, res.message
+                            );
+                        }
+                        None => break,
+                    }
+                }
+                _ = sync_tick.tick() => {
+                    match client.fetch_account_sync().await {
+                        Some(snap) => {
+                            eprintln!(
+                                "[DELTA_SYNC] OK | wallet={:.2} avail={:.2} btc={:.2} eth={:.2} sol={:.2}",
+                                snap.wallet_balance_usd,
+                                snap.available_balance_usd,
+                                snap.positions[0].size_contracts,
+                                snap.positions[1].size_contracts,
+                                snap.positions[2].size_contracts
+                            );
+                            if let Some(ref stx) = sync_tx {
+                                let _ = stx.try_send(snap);
+                            }
+                        }
+                        None => {
+                            eprintln!("[DELTA_SYNC] FAILED (check above HTTP status, API Key/Secret, or Whitelisted IP)");
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    (DeltaRestHandle { tx: Some(cmd_tx) }, Some(task))
+}
+
+#[cfg(test)]
+mod delta_rest_tests {
+    use super::*;
+
+    #[test]
+    fn test_hmac_sha256_rfc4231_vector() {
+        let sig = hmac_sha256_hex(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            sig,
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn test_delta_symbol_mapping_and_payload_no_gold() {
+        assert_eq!(delta_symbol_name(SymbolId(0)), Some("BTCUSD"));
+        assert_eq!(delta_symbol_name(SymbolId(1)), Some("ETHUSD"));
+        assert_eq!(delta_symbol_name(SymbolId(2)), Some("SOLUSD"));
+        assert_eq!(delta_symbol_name(SymbolId(3)), None);
+
+        let req = DeltaOrderRequest {
+            symbol_id: SymbolId(0),
+            side: DeltaOrderSide::Buy,
+            order_type: DeltaOrderType::Limit,
+            size_contracts: 1,
+            limit_price: Some(60_000.5),
+            post_only: true,
+            reduce_only: false,
+            client_order_id: "hmt_1".to_string(),
+        };
+        let payload = build_order_payload(&req);
+        assert!(payload.is_some());
+        if let Some(p) = payload {
+            assert!(p.contains("\"product_symbol\":\"BTCUSD\""));
+            assert!(p.contains("\"post_only\":true"));
+        }
+    }
+
+    #[test]
+    fn test_parse_wallet_and_positions_ignore_gold() {
+        let bal_json = r#"{"success":true,"result":[{"asset_symbol":"USD","balance":"1250.50","available_balance":"1100.25"}]}"#;
+        let bal = parse_wallet_balances_json(bal_json);
+        assert!(bal.is_some());
+        if let Some((w, a)) = bal {
+            assert!((w - 1250.50).abs() < 1e-6);
+            assert!((a - 1100.25).abs() < 1e-6);
+        }
+
+        let pos_json = r#"{"success":true,"result":[
+            {"product_symbol":"BTCUSD","size":2,"entry_price":"60010.5","unrealized_pnl":"12.4"},
+            {"product_symbol":"PAXGUSD","size":5,"entry_price":"2600.0","unrealized_pnl":"50.0"},
+            {"product_symbol":"SOLUSD","size":-3,"entry_price":"145.0","unrealized_pnl":"-1.5"}
+        ]}"#;
+        let pos = parse_positions_json(pos_json);
+        assert!((pos[0].size_contracts - 2.0).abs() < 1e-6);
+        assert!((pos[1].size_contracts - 0.0).abs() < 1e-6);
+        assert!((pos[2].size_contracts + 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_disabled_handle_zero_panic() {
+        let h = DeltaRestHandle::disabled();
+        assert!(!h.is_enabled());
+        assert!(!h.try_cancel_all(None));
+    }
+}
