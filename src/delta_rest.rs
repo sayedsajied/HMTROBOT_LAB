@@ -595,10 +595,11 @@ impl DeltaRestHandle {
     }
 }
 
-/// Spawns non-blocking Delta REST order dispatcher + 30s balance/position reconciler
+/// Spawns non-blocking Delta REST order dispatcher + 30s balance/position reconciler + Telegram LiveOrder HUD
 pub fn spawn_delta_rest_worker(
     cfg: DeltaRestConfig,
     sync_tx: Option<mpsc::Sender<DeltaSyncSnapshot>>,
+    hud: crate::telegram_hud::TelegramHudHandle,
 ) -> (DeltaRestHandle, Option<JoinHandle<()>>) {
     if !cfg.enabled {
         eprintln!("[DELTA_REST] DISABLED: DELTA_API_KEY or DELTA_API_SECRET missing in Render ENV");
@@ -629,6 +630,23 @@ pub fn spawn_delta_rest_worker(
                                 "[DELTA_ORDER] sym={:?} side={:?} sz={} ok={} status={} id={:?} msg={}",
                                 req.symbol_id, req.side, req.size_contracts, res.ok, res.status_code, res.exchange_order_id, res.message
                             );
+                            let dir = match req.side {
+                                DeltaOrderSide::Buy => crate::sniper_strategy::TradeDirection::Long,
+                                DeltaOrderSide::Sell => crate::sniper_strategy::TradeDirection::Short,
+                            };
+                            let oid = res
+                                .exchange_order_id
+                                .as_deref()
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(0);
+                            hud.try_send(crate::telegram_hud::HudEvent::LiveOrder {
+                                symbol_id: req.symbol_id,
+                                direction: dir,
+                                size_contracts: req.size_contracts,
+                                ok: res.ok,
+                                status_code: res.status_code,
+                                exchange_order_id: oid,
+                            });
                         }
                         Some(DeltaRestCommand::CancelAll(sym)) => {
                             let res = client.cancel_all_orders(sym).await;
@@ -666,6 +684,7 @@ pub fn spawn_delta_rest_worker(
 
     (DeltaRestHandle { tx: Some(cmd_tx) }, Some(task))
 }
+
 
 #[cfg(test)]
 mod delta_rest_tests {
